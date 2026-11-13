@@ -1,0 +1,43 @@
+[package]
+name = "wexpack"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "WexPack v2 container, content-defined deduplication and compression engine with authenticated encryption and recovery"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "wexpack"
+path = "src/lib.rs"
+
+[[bin]]
+name = "wxp"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+crossbeam-channel = "0.5.17"
+memmap2 = "0.9.12"
+rayon = "1.12.0"
+rpassword = "7.4"
+tempfile = "3.27.0"
+filetime = "0.2"
+argon2 = { version = "0.6.0", default-features = false, features = ["alloc", "zeroize"] }
+chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc", "zeroize"] }
+getrandom = "0.3.4"
+zeroize = { version = "1.8", features = ["alloc"] }
+bitflags = "2.13.2"
+blake3 = "1.8.7"
+byteorder = "1.5.0"
+crc32fast = "1.5.5"
+parking_lot = "0.13.0"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+rustix = { version = "1.1.5", features = ["fs"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[lints.rust]
+unsafe_code = "forbid"

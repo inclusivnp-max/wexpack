@@ -1,0 +1,5 @@
+/target
+*.wxp
+*.swp
+*.bak
+.DS_Store
