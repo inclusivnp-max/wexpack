@@ -84,7 +84,7 @@ enum Command {
         level: u8,
         #[arg(long)]
         dedup: bool,
-        /// Use larger independent chunks; random access remains available.
+        /// Share LZ history across files in bounded 16 MiB groups; selective reads decode one group.
         #[arg(long)]
         solid: bool,
         #[command(flatten)]

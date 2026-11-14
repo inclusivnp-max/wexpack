@@ -208,14 +208,39 @@ struct ProducerSummary {
     streamed_files: usize,
 }
 
-fn compress(mut job: Job, level: u8) -> Result<Finished> {
+fn compress(mut job: Job, level: u8, solid: bool) -> Result<Finished> {
     let buffers = job.lease.buffers_mut();
     let raw = job
         .mapped
         .as_ref()
         .map_or(buffers.input.as_slice(), MappedSpan::as_slice);
     let prepared = SmartTransform::prepare(raw, ProfileHint::Auto)?;
-    let codec = if prepared.bypass_compression {
+    let mut transform = prepared.transform;
+    let mut transformed_size = prepared.data.len();
+    let codec = if solid {
+        // High entropy in a sample says nothing about matches in earlier files.
+        // Compare identity with the selected transform before retaining that transform.
+        let mut identity = Vec::new();
+        let identity_codec = WexEngine::compress_solid_into(raw, level, &mut identity)?;
+        if prepared.transform != TransformType::None && prepared.data.len() <= MAX_SOLID_GROUP_SIZE
+        {
+            let filtered_codec =
+                WexEngine::compress_solid_into(&prepared.data, level, &mut buffers.output)?;
+            if buffers.output.len() < identity.len() {
+                filtered_codec
+            } else {
+                buffers.output = identity;
+                transform = TransformType::None;
+                transformed_size = raw.len();
+                identity_codec
+            }
+        } else {
+            buffers.output = identity;
+            transform = TransformType::None;
+            transformed_size = raw.len();
+            identity_codec
+        }
+    } else if prepared.bypass_compression {
         buffers.output.clear();
         buffers.output.extend_from_slice(&prepared.data);
         CodecType::Store
@@ -225,10 +250,10 @@ fn compress(mut job: Job, level: u8) -> Result<Finished> {
     let header = ChunkHeader {
         chunk_id: job.id,
         uncompressed_size: raw.len() as u32,
-        transformed_size: prepared.data.len() as u32,
+        transformed_size: transformed_size as u32,
         compressed_size: buffers.output.len() as u32,
         codec,
-        transform: prepared.transform,
+        transform,
         flags: ChunkFlags::empty(),
         hash: job.hash,
         crc32: crc32fast::hash(&buffers.output),
@@ -294,13 +319,7 @@ pub fn pack(
     password: Option<&[u8]>,
 ) -> Result<PackReport> {
     CompressionLevel::new(options.level)?;
-    let cdc = options.chunking.unwrap_or_else(|| {
-        if options.solid {
-            FastCdcConfig::preset_256k()
-        } else {
-            FastCdcConfig::default()
-        }
-    });
+    let cdc = options.chunking.unwrap_or_default();
     if !(1..=64).contains(&options.threads)
         || !(1..=256).contains(&options.queue_depth)
         || options.queue_depth < options.threads
@@ -311,6 +330,11 @@ pub fn pack(
         ));
     }
     let metadata_budget = options.memory_limit / 4;
+    if options.solid && cdc.max_size() > MAX_SOLID_GROUP_SIZE {
+        return Err(PipelineError::ResourceLimit(
+            "CDC chunk exceeds solid group",
+        ));
+    }
     if cdc.normalization() != 2 {
         return Err(invalid("WXP v2 uses FastCDC normalization=2"));
     }
@@ -321,25 +345,40 @@ pub fn pack(
         return Err(PipelineError::ResourceLimit("KDF and manifest workspace"));
     }
 
-    let scratch = if options.level >= 4 {
+    let chunk_capacity = if options.solid {
+        MAX_SOLID_GROUP_SIZE
+    } else {
+        cdc.max_size()
+    };
+    let scratch = if options.solid {
+        136 << 20
+    } else if options.level >= 4 {
         32 << 20
     } else {
         8 << 20
     };
-    let working = options
-        .threads
-        .checked_mul(scratch)
-        .and_then(|v| {
-            v.checked_add(
-                options
-                    .queue_depth
-                    .checked_mul(3 * cdc.max_size() + (64 << 10))?,
-            )
-        })
-        .and_then(|v| v.checked_add(cdc.max_size() + (128 << 10)))
-        .ok_or(PipelineError::ResourceLimit("workspace overflow"))?;
-    if working > options.memory_limit - metadata_budget {
-        return Err(PipelineError::ResourceLimit("worker and buffer workspace"));
+    // Threads/queue are upper bounds. A large solid history gets fewer concurrent
+    // workers rather than silently exceeding the caller's memory budget.
+    let mut workers = options.threads;
+    let mut slots = options.queue_depth;
+    loop {
+        let working = workers
+            .checked_mul(scratch)
+            .and_then(|v| v.checked_add(slots.checked_mul(2 * chunk_capacity + (64 << 10))?))
+            .and_then(|v| v.checked_add(3 * cdc.max_size() + (128 << 10)))
+            .ok_or(PipelineError::ResourceLimit("workspace overflow"))?;
+        if working <= options.memory_limit - metadata_budget {
+            break;
+        }
+        if !options.solid || (workers == 1 && slots == 1) {
+            return Err(PipelineError::ResourceLimit("worker and buffer workspace"));
+        }
+        if slots > workers {
+            slots -= 1;
+        } else {
+            workers -= 1;
+            slots = slots.min(workers * 2).max(workers);
+        }
     }
     let recovery = options
         .recovery_percent
@@ -370,7 +409,7 @@ pub fn pack(
             HeaderFlags::empty()
         }
         | if options.solid {
-            HeaderFlags::SOLID
+            HeaderFlags::SOLID | HeaderFlags::SOLID_GROUPS
         } else {
             HeaderFlags::empty()
         }
@@ -388,7 +427,7 @@ pub fn pack(
         flags,
         cdc.min_size().trailing_zeros() as u8,
         cdc.avg_size().trailing_zeros() as u8,
-        cdc.max_size().trailing_zeros() as u8,
+        chunk_capacity.trailing_zeros() as u8,
     )?;
     let mut sealer = password
         .map(|p| ArchiveSealer::with_limits(p, options.kdf, options.limits.crypto))
@@ -400,14 +439,14 @@ pub fn pack(
     if let Some(sealer) = &sealer {
         file.write_all(&sealer.descriptor().to_bytes())?;
     }
-    let buffers = BufferPool::new(options.queue_depth, cdc.max_size(), password.is_some())?;
+    let buffers = BufferPool::new(slots, chunk_capacity, password.is_some())?;
     let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(options.threads)
+        .num_threads(workers)
         .thread_name(|n| format!("wxp-codec-{n}"))
         .build()
         .map_err(|e| invalid(format!("create compression workers: {e}")))?;
-    let (jobs_tx, jobs_rx) = bounded::<Job>(options.queue_depth);
-    let (done_tx, done_rx) = bounded::<Result<Finished>>(options.queue_depth);
+    let (jobs_tx, jobs_rx) = bounded::<Job>(slots);
+    let (done_tx, done_rx) = bounded::<Result<Finished>>(slots);
     let (cancel_tx, cancel_rx) = bounded::<()>(0);
     let ((descriptors, payload_bytes, transform_saved, compression_saved), summary) =
         std::thread::scope(|scope| -> Result<_> {
@@ -427,11 +466,11 @@ pub fn pack(
             });
             let consumers=scope.spawn(move|| {
             pool.scope(|scope| {
-                for _ in 0..options.threads {
-                    let jobs=jobs_rx.clone();let done=done_tx.clone();let cancelled=cancel_rx.clone();let level=options.level;
+                for _ in 0..workers {
+                    let jobs=jobs_rx.clone();let done=done_tx.clone();let cancelled=cancel_rx.clone();let level=options.level;let solid=options.solid;
                     scope.spawn(move |_|loop {
                         let job=select! {recv(cancelled)->_=>break,recv(jobs)->job=>match job {Ok(j)=>j,Err(_)=>break}};
-                        let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||compress(job,level)))
+                        let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||compress(job,level,solid)))
                             .unwrap_or(Err(PipelineError::WorkerPanicked));
                         let failed=result.is_err();
                         select! {recv(cancelled)->_=>break,send(done,result)->sent=>if sent.is_err() {break;}}

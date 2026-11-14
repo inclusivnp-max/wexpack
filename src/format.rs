@@ -20,6 +20,7 @@ pub const CHUNK_DESCRIPTOR_SIZE: usize = 64;
 pub const INDEX_ENVELOPE_SIZE: usize = 32;
 pub const FEC_SENTINEL_SIZE: usize = 32;
 pub const FILE_ENTRY_BASE_SIZE: u64 = 66;
+pub const MAX_SOLID_GROUP_SIZE: usize = 16 << 20;
 pub const MAX_CHUNK_SIZE: u32 = 1 << 26;
 pub const MAX_STORED_CHUNK_SIZE: u32 = 1 << 27;
 
@@ -59,6 +60,8 @@ bitflags::bitflags! {
         const REED_SOLOMON = 1 << 3;
         const PRECOMP = 1 << 4;
         const ENCRYPTED_DATA = 1 << 5;
+        /// Extended 12-byte file references and independently decoded solid groups.
+        const SOLID_GROUPS = 1 << 6;
     }
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     #[repr(transparent)]
@@ -263,6 +266,11 @@ impl SuperBlock {
             return Err(FormatError::UnsupportedVersion(self.version));
         }
         header_flags(self.flags.bits())?;
+        if self.flags.contains(HeaderFlags::SOLID_GROUPS)
+            && !self.flags.contains(HeaderFlags::SOLID)
+        {
+            return Err(invalid("solid groups require SOLID feature"));
+        }
         if self.header_size != 64 {
             return Err(invalid("header size must be 64"));
         }
@@ -572,6 +580,12 @@ pub fn validate_path(path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Byte range of a logical dedup chunk inside its physical solid group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkRange {
+    pub offset: u32,
+    pub size: u32,
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileEntry {
     pub path: String,
@@ -585,6 +599,8 @@ pub struct FileEntry {
     /// Archive-root-relative path. Extraction must resolve links after regular files.
     pub symlink_target: Option<String>,
     pub chunk_ids: Vec<ChunkId>,
+    /// Empty for legacy whole-chunk references; one range per ID for SOLID_GROUPS.
+    pub chunk_ranges: Vec<ChunkRange>,
 }
 impl FileEntry {
     pub fn is_dir(&self) -> bool {
@@ -621,10 +637,27 @@ impl FileEntry {
             return Err(invalid("invalid empty-file content"));
         }
         count32(self.chunk_ids.len())?;
+        if !self.chunk_ranges.is_empty()
+            && (self.chunk_ranges.len() != self.chunk_ids.len()
+                || self.chunk_ranges.iter().any(|r| {
+                    r.size == 0
+                        || u64::from(r.offset) + u64::from(r.size) > MAX_SOLID_GROUP_SIZE as u64
+                }))
+        {
+            return Err(invalid("solid reference ranges"));
+        }
         Ok(())
     }
     pub fn write_to<W: Write>(&self, w: &mut W) -> Result<()> {
+        self.write_with_solid(w, false)
+    }
+    fn write_with_solid<W: Write>(&self, w: &mut W, solid: bool) -> Result<()> {
         self.validate()?;
+        if (solid && self.chunk_ranges.len() != self.chunk_ids.len())
+            || (!solid && !self.chunk_ranges.is_empty())
+        {
+            return Err(invalid("reference encoding/feature mismatch"));
+        }
         w.write_u16::<LittleEndian>(self.path.len() as u16)?;
         w.write_all(self.path.as_bytes())?;
         w.write_u64::<LittleEndian>(self.file_size)?;
@@ -637,12 +670,19 @@ impl FileEntry {
         w.write_u16::<LittleEndian>(target.len() as u16)?;
         w.write_all(target.as_bytes())?;
         w.write_u32::<LittleEndian>(count32(self.chunk_ids.len())?)?;
-        for id in &self.chunk_ids {
+        for (n, id) in self.chunk_ids.iter().enumerate() {
             w.write_u32::<LittleEndian>(id.get())?;
+            if solid {
+                w.write_u32::<LittleEndian>(self.chunk_ranges[n].offset)?;
+                w.write_u32::<LittleEndian>(self.chunk_ranges[n].size)?;
+            }
         }
         Ok(())
     }
     pub fn read_from<R: Read>(r: &mut R, limits: DecodeLimits) -> Result<Self> {
+        Self::read_with_solid(r, limits, false)
+    }
+    fn read_with_solid<R: Read>(r: &mut R, limits: DecodeLimits, solid: bool) -> Result<Self> {
         fn string<R: Read>(r: &mut R, limit: usize) -> Result<String> {
             let n = r.read_u16::<LittleEndian>()? as usize;
             if n > limit {
@@ -667,6 +707,7 @@ impl FileEntry {
         }
         // Grow only as bytes actually arrive: an untrusted count cannot preallocate gigabytes.
         let mut chunk_ids = Vec::new();
+        let mut chunk_ranges = Vec::new();
         for _ in 0..count {
             let id = ChunkId::new(r.read_u32::<LittleEndian>()?)?;
             if chunk_ids.len() == chunk_ids.capacity() {
@@ -675,6 +716,18 @@ impl FileEntry {
                     .map_err(|_| FormatError::ResourceLimit("chunk references"))?;
             }
             chunk_ids.push(id);
+            if solid {
+                let range = ChunkRange {
+                    offset: r.read_u32::<LittleEndian>()?,
+                    size: r.read_u32::<LittleEndian>()?,
+                };
+                if chunk_ranges.len() == chunk_ranges.capacity() {
+                    chunk_ranges
+                        .try_reserve(1)
+                        .map_err(|_| FormatError::ResourceLimit("solid references"))?;
+                }
+                chunk_ranges.push(range);
+            }
         }
         let value = Self {
             path,
@@ -690,6 +743,7 @@ impl FileEntry {
                 Some(target)
             },
             chunk_ids,
+            chunk_ranges,
         };
         value.validate()?;
         Ok(value)
@@ -724,6 +778,11 @@ impl IndexFooter {
     }
     pub fn validate(&self) -> Result<()> {
         header_flags(self.flags.bits())?;
+        if self.flags.contains(HeaderFlags::SOLID_GROUPS)
+            && !self.flags.contains(HeaderFlags::SOLID)
+        {
+            return Err(invalid("solid groups require SOLID feature"));
+        }
         if self.flags.contains(HeaderFlags::ENCRYPTED_INDEX)
             && !self.flags.contains(HeaderFlags::ENCRYPTED_DATA)
         {
@@ -734,6 +793,13 @@ impl IndexFooter {
         let mut previous_end = None;
         for (index, chunk) in self.chunk_table.iter().enumerate() {
             chunk.header.validate()?;
+            if self.flags.contains(HeaderFlags::SOLID_GROUPS)
+                && (chunk.header.uncompressed_size as usize > MAX_SOLID_GROUP_SIZE
+                    || chunk.header.transformed_size as usize > MAX_SOLID_GROUP_SIZE
+                    || chunk.header.compressed_size as usize > MAX_SOLID_GROUP_SIZE + 16)
+            {
+                return Err(invalid("solid group exceeds limit"));
+            }
             if chunk.header.chunk_id.get() as usize != index {
                 return Err(invalid("non-dense ChunkIDs"));
             }
@@ -763,12 +829,29 @@ impl IndexFooter {
                 return Err(invalid("duplicate file path"));
             }
             let mut size = 0;
-            for id in &file.chunk_ids {
+            let solid = self.flags.contains(HeaderFlags::SOLID_GROUPS);
+            if (solid && file.chunk_ranges.len() != file.chunk_ids.len())
+                || (!solid && !file.chunk_ranges.is_empty())
+            {
+                return Err(invalid("reference encoding/feature mismatch"));
+            }
+            for (n, id) in file.chunk_ids.iter().enumerate() {
                 let chunk = self
                     .chunk_table
                     .get(id.get() as usize)
                     .ok_or_else(|| invalid("dangling ChunkID"))?;
-                size = add(size, chunk.header.uncompressed_size.into())?;
+                let length = if solid {
+                    let range = file.chunk_ranges[n];
+                    if u64::from(range.offset) + u64::from(range.size)
+                        > u64::from(chunk.header.uncompressed_size)
+                    {
+                        return Err(invalid("solid reference exceeds group"));
+                    }
+                    range.size
+                } else {
+                    chunk.header.uncompressed_size
+                };
+                size = add(size, length.into())?;
             }
             if size != file.file_size {
                 return Err(invalid("file size differs from referenced chunks"));
@@ -843,7 +926,11 @@ impl IndexFooter {
                 add(
                     base,
                     (f.chunk_ids.len() as u64)
-                        .checked_mul(4)
+                        .checked_mul(if self.flags.contains(HeaderFlags::SOLID_GROUPS) {
+                            12
+                        } else {
+                            4
+                        })
                         .ok_or_else(|| invalid("references overflow"))?,
                 )?,
             )?;
@@ -873,12 +960,17 @@ impl IndexFooter {
                 FILE_ENTRY_BASE_SIZE
                     + file.path.len() as u64
                     + file.symlink_target.as_ref().map_or(0, |s| s.len() as u64)
-                    + file.chunk_ids.len() as u64 * 4,
+                    + file.chunk_ids.len() as u64
+                        * if self.flags.contains(HeaderFlags::SOLID_GROUPS) {
+                            12
+                        } else {
+                            4
+                        },
             )?;
             b.write_u64::<LittleEndian>(offset)?;
         }
         for file in &self.file_table {
-            file.write_to(&mut b)?;
+            file.write_with_solid(&mut b, self.flags.contains(HeaderFlags::SOLID_GROUPS))?;
         }
         let checksum = *blake3::hash(&b).as_bytes();
         b.extend_from_slice(&checksum);
@@ -946,10 +1038,21 @@ impl IndexFooter {
             }
             let mut record = Cursor::new(&entries[pair[0] as usize..pair[1] as usize]);
             let local_limits = DecodeLimits {
-                max_references: references_left.min(record.get_ref().len() / 4),
+                max_references: references_left.min(
+                    record.get_ref().len()
+                        / if flags.contains(HeaderFlags::SOLID_GROUPS) {
+                            12
+                        } else {
+                            4
+                        },
+                ),
                 ..limits
             };
-            let file = FileEntry::read_from(&mut record, local_limits)?;
+            let file = FileEntry::read_with_solid(
+                &mut record,
+                local_limits,
+                flags.contains(HeaderFlags::SOLID_GROUPS),
+            )?;
             if record.position() != pair[1] - pair[0] {
                 return Err(invalid("trailing bytes in file record"));
             }

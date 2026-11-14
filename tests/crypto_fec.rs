@@ -632,6 +632,7 @@ fn encrypted_archive(source: &[u8]) -> Vec<u8> {
             flags: FileFlags::REGULAR,
             symlink_target: None,
             chunk_ids: vec![ChunkId::new(0).unwrap()],
+            chunk_ranges: Vec::new(),
         }],
     )
     .unwrap();

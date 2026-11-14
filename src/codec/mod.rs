@@ -247,6 +247,21 @@ impl WexEngine {
     }
     /// The output buffer can be retained by a worker between chunks.
     pub fn compress_into(data: &[u8], level: u8, output: &mut Vec<u8>) -> Result<CodecType> {
+        Self::compress_frame(data, level, output, false)
+    }
+    /// WXE revision 2 keeps LZ history across blocks inside a bounded solid frame.
+    pub fn compress_solid_into(data: &[u8], level: u8, output: &mut Vec<u8>) -> Result<CodecType> {
+        if data.len() > lz::SOLID_WINDOW {
+            return Err(CodecError::InputLimit);
+        }
+        Self::compress_frame(data, level, output, true)
+    }
+    fn compress_frame(
+        data: &[u8],
+        level: u8,
+        output: &mut Vec<u8>,
+        solid: bool,
+    ) -> Result<CodecType> {
         let level = CompressionLevel::new(level)?;
         if data.len() > MAX_STORED_CHUNK_SIZE as usize {
             return Err(CodecError::InputLimit);
@@ -260,7 +275,7 @@ impl WexEngine {
         if data.is_empty() {
             return Ok(CodecType::Store);
         }
-        output.extend_from_slice(b"WXE\x01");
+        output.extend_from_slice(if solid { b"WXE\x02" } else { b"WXE\x01" });
         output.extend([level.codec() as u8, level.get(), 0, 0]);
         output.extend_from_slice(&(data.len() as u32).to_le_bytes());
         output.extend_from_slice(&(blocks as u32).to_le_bytes());
@@ -268,13 +283,35 @@ impl WexEngine {
         let header_crc = crc32fast::hash(output);
         output.extend_from_slice(&header_crc.to_le_bytes());
         let (mode, options) = level.lz();
-        for block in data.chunks(BLOCK_SIZE) {
+        let mut solid_finder = if solid {
+            let mut solid_options = options;
+            solid_options.window_size = lz::SOLID_WINDOW;
+            // Keep about four positions per bucket, rather than forcing long
+            // random-data collision chains as the history grows to 16 MiB.
+            solid_options.hash_bits = (data
+                .len()
+                .max(1)
+                .next_power_of_two()
+                .trailing_zeros()
+                .saturating_sub(2))
+            .clamp(16, 22) as u8;
+
+            Some(lz::MatchFinder::new(data, solid_options)?)
+        } else {
+            None
+        };
+        for (n, block) in data.chunks(BLOCK_SIZE).enumerate() {
             let mut best = Candidate {
                 method: Method::Store,
                 intermediate: 0,
                 payload: Cow::Borrowed(block),
             };
-            let lz = lz::encode(block, mode, options)?;
+            let lz = if let Some(finder) = &mut solid_finder {
+                let start = n * BLOCK_SIZE;
+                lz::encode_solid_block(finder, start..start + block.len(), mode)?
+            } else {
+                lz::encode(block, mode, options)?
+            };
             match level.codec() {
                 CodecType::WexBalanced => {
                     best.consider(Method::LzAns, lz.len(), ans::encode(&lz)?);
@@ -331,8 +368,13 @@ impl WexEngine {
             return Ok(());
         }
         let mut r = Reader::new(data);
-        if r.take(4)? != b"WXE\x01" || r.u8()? != codec as u8 {
+        let magic = r.take(4)?;
+        let solid = magic == b"WXE\x02";
+        if (magic != b"WXE\x01" && !solid) || r.u8()? != codec as u8 {
             return Err(invalid("frame magic or codec"));
+        }
+        if solid && expected_size > lz::SOLID_WINDOW {
+            return Err(CodecError::OutputLimit);
         }
         let level = CompressionLevel::new(r.u8()?)?;
         if level.codec() != codec || r.u16()? != 0 {
@@ -384,23 +426,36 @@ impl WexEngine {
                 return Err(invalid("block payload size"));
             }
             let payload = r.take(stored)?;
-            let decoded = match method {
-                Method::Store => {
-                    let mut copy = bytes(payload.len())?;
-                    copy.extend_from_slice(payload);
-                    copy
+            let begin = out.len();
+            match method {
+                Method::Store => out.extend_from_slice(payload),
+                Method::Lz | Method::LzAns | Method::LzCm => {
+                    let decoded;
+                    let lz_payload = match method {
+                        Method::Lz => {
+                            exact(stored, intermediate)?;
+                            payload
+                        }
+                        Method::LzAns => {
+                            decoded = ans::decode(payload, intermediate)?;
+                            &decoded
+                        }
+                        Method::LzCm => {
+                            decoded = cm::decode(payload, intermediate)?;
+                            &decoded
+                        }
+                        _ => unreachable!(),
+                    };
+                    if solid {
+                        lz::decode_append(lz_payload, raw_size, out, true)?;
+                    } else {
+                        out.extend_from_slice(&lz::decode(lz_payload, raw_size)?);
+                    }
                 }
-                Method::Lz => {
-                    exact(stored, intermediate)?;
-                    lz::decode(payload, raw_size)?
-                }
-                Method::LzAns => lz::decode(&ans::decode(payload, intermediate)?, raw_size)?,
-                Method::LzCm => lz::decode(&cm::decode(payload, intermediate)?, raw_size)?,
-                Method::Ans => ans::decode(payload, raw_size)?,
-                Method::Cm => cm::decode(payload, raw_size)?,
-            };
-            crc(&decoded, checksum)?;
-            out.extend_from_slice(&decoded);
+                Method::Ans => out.extend_from_slice(&ans::decode(payload, raw_size)?),
+                Method::Cm => out.extend_from_slice(&cm::decode(payload, raw_size)?),
+            }
+            crc(&out[begin..], checksum)?;
         }
         r.finish()?;
         exact(out.len(), expected_size)?;

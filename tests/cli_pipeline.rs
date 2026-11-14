@@ -209,7 +209,7 @@ fn one_credit_bounds_reordering_and_reuses_buffers() {
     assert_eq!(report.mapped_files, 0);
 }
 #[test]
-fn solid_uses_larger_independent_chunks_and_keeps_selective_access() {
+fn solid_groups_keep_small_cdc_and_selective_access() {
     let root = tempfile::tempdir().unwrap();
     let source = root.path().join("data.bin");
     let data = random(900_003);
@@ -228,7 +228,9 @@ fn solid_uses_larger_independent_chunks_and_keeps_selective_access() {
     .unwrap();
     let mut reader = ArchiveReader::open(&archive, None, ReadLimits::default()).unwrap();
     assert!(reader.header().flags.contains(HeaderFlags::SOLID));
-    assert_eq!(reader.header().chunk_avg_bits, 18);
+    assert_eq!(reader.header().chunk_avg_bits, 16);
+    assert!(reader.header().flags.contains(HeaderFlags::SOLID_GROUPS));
+    assert_eq!(reader.header().chunk_count, 1);
     let mut output = Vec::new();
     reader.extract_file("data.bin", &mut output).unwrap();
     assert_eq!(output, data);
@@ -517,6 +519,7 @@ fn empty_entry(name: &str) -> FileEntry {
         flags: FileFlags::REGULAR,
         symlink_target: None,
         chunk_ids: vec![],
+        chunk_ranges: Vec::new(),
     }
 }
 #[test]

@@ -24,6 +24,7 @@ pub struct ArchiveReader {
     paths: HashMap<String, usize>,
     crypto: Option<ArchiveOpener>,
     limits: ReadLimits,
+    solid_cache: Option<(ChunkId, Zeroizing<Vec<u8>>)>,
 }
 fn read_fixed<const N: usize>(file: &mut File, offset: u64) -> Result<[u8; N]> {
     let mut b = [0; N];
@@ -123,6 +124,7 @@ impl ArchiveReader {
             paths,
             crypto,
             limits,
+            solid_cache: None,
         })
     }
     pub fn header(&self) -> &SuperBlock {
@@ -189,7 +191,20 @@ impl ArchiveReader {
         header.verify_original(&original)?;
         Ok(original)
     }
-    /// Streams one file, keeping at most one decoded chunk live.
+    fn cache_solid_group(&mut self, id: ChunkId) -> Result<()> {
+        if self
+            .solid_cache
+            .as_ref()
+            .is_some_and(|(cached, _)| *cached == id)
+        {
+            return Ok(());
+        }
+        // Drop and wipe the previous group before allocating its replacement.
+        self.solid_cache = None;
+        self.solid_cache = Some((id, self.read_chunk(id)?));
+        Ok(())
+    }
+    /// Streams one file, keeping at most one decoded solid group live.
     pub fn extract_file<W: Write>(&mut self, name: &str, output: &mut W) -> Result<u64> {
         let number = *self
             .paths
@@ -202,10 +217,26 @@ impl ArchiveReader {
         let mut size = 0;
         for n in 0..self.index.file_table[number].chunk_ids.len() {
             let id = self.index.file_table[number].chunk_ids[n];
-            let data = self.read_chunk(id)?;
-            output.write_all(&data)?;
-            hash.update(&data);
-            size += data.len() as u64;
+            if self.header.flags.contains(HeaderFlags::SOLID_GROUPS) {
+                self.cache_solid_group(id)?;
+                let range = self.index.file_table[number].chunk_ranges[n];
+                let group = &self
+                    .solid_cache
+                    .as_ref()
+                    .ok_or_else(|| invalid("missing decoded solid group"))?
+                    .1;
+                let data = group
+                    .get(range.offset as usize..range.offset as usize + range.size as usize)
+                    .ok_or_else(|| invalid("solid extraction range"))?;
+                output.write_all(data)?;
+                hash.update(data);
+                size += data.len() as u64;
+            } else {
+                let data = self.read_chunk(id)?;
+                output.write_all(&data)?;
+                hash.update(&data);
+                size += data.len() as u64;
+            }
         }
         let entry = &self.index.file_table[number];
         if size != entry.file_size || hash.finalize().as_bytes() != &entry.file_hash {

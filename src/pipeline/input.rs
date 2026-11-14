@@ -168,6 +168,7 @@ pub(super) fn collect(
                     flags,
                     symlink_target: None,
                     chunk_ids: Vec::new(),
+                    chunk_ranges: Vec::new(),
                 },
             },
         )?;
@@ -223,8 +224,29 @@ struct Actor<'a> {
     references: usize,
     total: u64,
     unique: u64,
+    group: Option<BufferLease>,
+    group_next: u32,
+    locations: Vec<(ChunkId, ChunkRange)>,
 }
 impl Actor<'_> {
+    fn flush_group(&mut self) -> Result<()> {
+        let Some(mut lease) = self.group.take() else {
+            return Ok(());
+        };
+        let hash = *blake3::hash(&lease.buffers_mut().input).as_bytes();
+        let id = ChunkId::new(self.group_next)?;
+        self.group_next = self
+            .group_next
+            .checked_add(1)
+            .ok_or(PipelineError::ResourceLimit("solid group count"))?;
+        let job = Job {
+            id,
+            hash,
+            lease,
+            mapped: None,
+        };
+        select! {recv(self.cancel)->_=>Err(PipelineError::Cancelled),send(self.jobs,job)->sent=>sent.map_err(|_|PipelineError::Cancelled)}
+    }
     fn chunk(
         &mut self,
         data: &[u8],
@@ -256,7 +278,11 @@ impl Actor<'_> {
         };
         self.metadata_used = self
             .metadata_used
-            .checked_add(if duplicate { 8 } else { 264 })
+            .checked_add(if duplicate {
+                if self.options.solid { 24 } else { 8 }
+            } else {
+                288
+            })
             .ok_or(PipelineError::ResourceLimit("metadata overflow"))?;
         if self.metadata_used > self.metadata_budget {
             return Err(PipelineError::ResourceLimit("dedup/index metadata"));
@@ -273,6 +299,34 @@ impl Actor<'_> {
             .checked_add(1)
             .ok_or(PipelineError::ResourceLimit("ChunkID"))?;
         self.unique += data.len() as u64;
+        if self.options.solid {
+            if self
+                .group
+                .as_mut()
+                .is_some_and(|g| g.buffers_mut().input.len() + data.len() > MAX_SOLID_GROUP_SIZE)
+            {
+                self.flush_group()?;
+            }
+            if self.group.is_none() {
+                self.group = Some(self.pool.acquire(self.cancel)?);
+            }
+            let input = &mut self
+                .group
+                .as_mut()
+                .ok_or_else(|| invalid("missing solid buffer"))?
+                .buffers_mut()
+                .input;
+            let location = (
+                ChunkId::new(self.group_next)?,
+                ChunkRange {
+                    offset: input.len() as u32,
+                    size: data.len() as u32,
+                },
+            );
+            input.extend_from_slice(data);
+            push(&mut self.locations, location)?;
+            return Ok(());
+        }
         let mut lease = self.pool.acquire(self.cancel)?;
         if mapped.is_none() {
             lease.buffers_mut().input.extend_from_slice(data);
@@ -314,6 +368,9 @@ pub(super) fn produce(
         references: 0,
         total: 0,
         unique: 0,
+        group: None,
+        group_next: 0,
+        locations: Vec::new(),
     };
     let mut files = Vec::new();
     let mut mapped_files = 0;
@@ -380,6 +437,20 @@ pub(super) fn produce(
         }
         item.entry.validate()?;
         push(&mut files, item.entry)?;
+    }
+    if options.solid {
+        actor.flush_group()?;
+        for file in &mut files {
+            for id in &mut file.chunk_ids {
+                let (group, range) = *actor
+                    .locations
+                    .get(id.get() as usize)
+                    .ok_or_else(|| invalid("missing solid chunk location"))?;
+                *id = group;
+                push(&mut file.chunk_ranges, range)?;
+            }
+            file.validate()?;
+        }
     }
     Ok(ProducerSummary {
         files,
@@ -450,6 +521,7 @@ mod tests {
                 flags: FileFlags::REGULAR,
                 symlink_target: None,
                 chunk_ids: Vec::new(),
+                chunk_ranges: Vec::new(),
             },
         };
         let options = PackOptions {

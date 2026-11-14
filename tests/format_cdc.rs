@@ -25,6 +25,7 @@ fn file(path: &str, content: &[u8], ids: &[u32]) -> FileEntry {
         flags: FileFlags::REGULAR,
         symlink_target: None,
         chunk_ids: ids.iter().map(|&id| ChunkId::new(id).unwrap()).collect(),
+        chunk_ranges: Vec::new(),
     }
 }
 fn chunk(id: u32, bytes: &[u8], offset: u64) -> ChunkDescriptor {

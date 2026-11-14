@@ -3,6 +3,10 @@
 //! over every match visible to the bounded match finder, including shorter matches.
 use super::{BLOCK_SIZE, CodecError, MAX_LZ_SIZE, Reader, Result, bytes, exact, invalid, vector};
 use std::cmp::Reverse;
+use std::ops::Range;
+
+/// A solid frame never imports history from another independently decoded frame.
+pub const SOLID_WINDOW: usize = 16 << 20;
 use std::collections::BinaryHeap;
 
 pub const MIN_MATCH: usize = 4;
@@ -24,10 +28,10 @@ impl Default for LzOptions {
 }
 impl LzOptions {
     fn validate(self) -> Result<()> {
-        if !(8..=18).contains(&self.hash_bits)
+        if !(8..=22).contains(&self.hash_bits)
             || !(1..=1024).contains(&self.chain_depth)
             || self.window_size == 0
-            || self.window_size > BLOCK_SIZE
+            || self.window_size > SOLID_WINDOW
         {
             return Err(invalid("LZ finder options"));
         }
@@ -61,7 +65,7 @@ pub struct MatchFinder<'a> {
 impl<'a> MatchFinder<'a> {
     pub fn new(input: &'a [u8], options: LzOptions) -> Result<Self> {
         options.validate()?;
-        if input.len() > BLOCK_SIZE {
+        if input.len() > SOLID_WINDOW {
             return Err(CodecError::InputLimit);
         }
         Ok(Self {
@@ -83,12 +87,12 @@ impl<'a> MatchFinder<'a> {
     }
     /// Best length for each ULEB128 distance-price class. All positions before
     /// `position` must have been inserted; future bytes are never dictionary entries.
-    pub fn find(&self, position: usize, max_length: usize) -> Result<[Match; 3]> {
+    pub fn find(&self, position: usize, max_length: usize) -> Result<[Match; 4]> {
         if position != self.cursor || position > self.input.len() {
             return Err(invalid("nonsequential match lookup"));
         }
         let limit = max_length.min(self.input.len() - position);
-        let mut best = [Match::default(); 3];
+        let mut best = [Match::default(); 4];
         if limit < MIN_MATCH {
             return Ok(best);
         }
@@ -104,14 +108,25 @@ impl<'a> MatchFinder<'a> {
                 break;
             }
             let class = varint_size((distance - 1) as u32) - 1;
-            let length = common_prefix(
-                &self.input[position..position + limit],
-                &self.input[candidate_pos..candidate_pos + limit],
-            );
+            // A candidate cannot improve this distance-price class if it already
+            // differs at the current best length. Avoid re-scanning long prefixes.
+            let known = best[class].length;
+            let length = if known < limit
+                && self.input[position + known] == self.input[candidate_pos + known]
+                && self.input[position..position + MIN_MATCH]
+                    == self.input[candidate_pos..candidate_pos + MIN_MATCH]
+            {
+                common_prefix(
+                    &self.input[position..position + limit],
+                    &self.input[candidate_pos..candidate_pos + limit],
+                )
+            } else {
+                0
+            };
             if length >= MIN_MATCH && length > best[class].length {
                 best[class] = Match { length, distance };
             }
-            if best[0].length == limit || self.previous.is_empty() {
+            if length == limit || self.previous.is_empty() {
                 break;
             }
             candidate = self.previous[candidate_pos];
@@ -189,7 +204,7 @@ pub fn token_cost_bits(token: Token) -> Result<u32> {
         Token::Literal(_) => Ok(9),
         Token::Match { length, distance }
             if (MIN_MATCH..=BLOCK_SIZE).contains(&length)
-                && (1..=BLOCK_SIZE).contains(&distance) =>
+                && (1..=SOLID_WINDOW).contains(&distance) =>
         {
             Ok(1 + 8
                 * (varint_size((length - MIN_MATCH) as u32) + varint_size((distance - 1) as u32))
@@ -198,9 +213,18 @@ pub fn token_cost_bits(token: Token) -> Result<u32> {
         _ => Err(invalid("LZ token values")),
     }
 }
-fn best_match(candidates: [Match; 3]) -> Match {
+fn best_match(candidates: [Match; 4]) -> Match {
     candidates
         .into_iter()
+        // Four-byte distances can make a four-byte match larger than literals.
+        .filter(|m| {
+            m.length >= MIN_MATCH
+                && token_cost_bits(Token::Match {
+                    length: m.length,
+                    distance: m.distance,
+                })
+                .is_ok_and(|cost| cost < 9 * m.length as u32)
+        })
         .max_by_key(|m| (m.length, usize::MAX - m.distance))
         .unwrap_or_default()
 }
@@ -208,15 +232,16 @@ fn parse_greedy(
     input: &[u8],
     finder: &mut MatchFinder<'_>,
     lazy: bool,
+    range: Range<usize>,
     emit: &mut impl FnMut(Token) -> Result<()>,
 ) -> Result<()> {
-    let mut position = 0;
-    while position < input.len() {
-        let current = best_match(finder.find(position, input.len() - position)?);
+    let mut position = range.start;
+    while position < range.end {
+        let current = best_match(finder.find(position, range.end - position)?);
         finder.insert(position)?;
         if current.length >= MIN_MATCH {
-            if lazy && position + 1 < input.len() {
-                let next = best_match(finder.find(position + 1, input.len() - position - 1)?);
+            if lazy && position + 1 < range.end {
+                let next = best_match(finder.find(position + 1, range.end - position - 1)?);
                 if next.length > current.length + 1 {
                     emit(Token::Literal(input[position]))?;
                     position += 1;
@@ -263,6 +288,7 @@ fn parse_optimal(
     input: &[u8],
     finder: &mut MatchFinder<'_>,
     horizon: usize,
+    range: Range<usize>,
     emit: &mut impl FnMut(Token) -> Result<()>,
 ) -> Result<()> {
     if !(4..=4096).contains(&horizon) {
@@ -273,17 +299,17 @@ fn parse_optimal(
     let mut pending: BinaryHeap<Reverse<Pending>> = BinaryHeap::new();
     let mut active: BinaryHeap<Reverse<Active>> = BinaryHeap::new();
     pending
-        .try_reserve(6 * horizon)
+        .try_reserve(12 * horizon)
         .map_err(|_| CodecError::AllocationFailed)?;
     active
-        .try_reserve(6 * horizon)
+        .try_reserve(12 * horizon)
         .map_err(|_| CodecError::AllocationFailed)?;
     let mut reversed = Vec::new();
     reversed
         .try_reserve_exact(horizon)
         .map_err(|_| CodecError::AllocationFailed)?;
-    for base in (0..input.len()).step_by(horizon) {
-        let count = horizon.min(input.len() - base);
+    for base in (range.start..range.end).step_by(horizon) {
+        let count = horizon.min(range.end - base);
         pending.clear();
         active.clear();
         costs[0] = 0;
@@ -376,9 +402,11 @@ fn visit(
 ) -> Result<()> {
     let mut finder = MatchFinder::new(input, options)?;
     match mode {
-        ParseMode::Greedy => parse_greedy(input, &mut finder, false, &mut emit),
-        ParseMode::Lazy => parse_greedy(input, &mut finder, true, &mut emit),
-        ParseMode::Optimal { horizon } => parse_optimal(input, &mut finder, horizon, &mut emit),
+        ParseMode::Greedy => parse_greedy(input, &mut finder, false, 0..input.len(), &mut emit),
+        ParseMode::Lazy => parse_greedy(input, &mut finder, true, 0..input.len(), &mut emit),
+        ParseMode::Optimal { horizon } => {
+            parse_optimal(input, &mut finder, horizon, 0..input.len(), &mut emit)
+        }
     }
 }
 pub fn parse(input: &[u8], mode: ParseMode, options: LzOptions) -> Result<Vec<Token>> {
@@ -424,6 +452,7 @@ struct TokenWriter {
     flag: usize,
     slot: usize,
     produced: usize,
+    history: usize,
 }
 impl TokenWriter {
     fn new() -> Result<Self> {
@@ -432,13 +461,18 @@ impl TokenWriter {
             flag: 0,
             slot: 0,
             produced: 0,
+            history: 0,
         })
     }
     fn push(&mut self, token: Token) -> Result<()> {
         let consumed = match token {
             Token::Literal(_) => 1,
             Token::Match { length, distance } => {
-                if length < MIN_MATCH || distance == 0 || distance > self.produced {
+                if length < MIN_MATCH
+                    || distance == 0
+                    || distance > self.history + self.produced
+                    || distance > SOLID_WINDOW
+                {
                     return Err(invalid("invalid LZ reference"));
                 }
                 length
@@ -483,16 +517,60 @@ pub fn encode(input: &[u8], mode: ParseMode, options: LzOptions) -> Result<Vec<u
     exact(writer.produced, input.len())?;
     Ok(writer.output)
 }
+/// Emits one block while retaining the finder over the complete solid input.
+pub(super) fn encode_solid_block(
+    finder: &mut MatchFinder<'_>,
+    range: Range<usize>,
+    mode: ParseMode,
+) -> Result<Vec<u8>> {
+    if range.start != finder.cursor
+        || range.end > finder.input.len()
+        || range.end < range.start
+        || range.len() > BLOCK_SIZE
+    {
+        return Err(invalid("solid LZ block range"));
+    }
+    let mut writer = TokenWriter::new()?;
+    writer.history = range.start;
+    let expected = range.len();
+    let input = finder.input;
+    match mode {
+        ParseMode::Greedy => parse_greedy(input, finder, false, range, &mut |t| writer.push(t))?,
+        ParseMode::Lazy => parse_greedy(input, finder, true, range, &mut |t| writer.push(t))?,
+        ParseMode::Optimal { horizon } => {
+            parse_optimal(input, finder, horizon, range, &mut |t| writer.push(t))?
+        }
+    }
+    exact(writer.produced, expected)?;
+    Ok(writer.output)
+}
 pub fn decode(input: &[u8], expected_size: usize) -> Result<Vec<u8>> {
+    let mut out = bytes(expected_size.min(BLOCK_SIZE))?;
+    decode_append(input, expected_size, &mut out, false)?;
+    Ok(out)
+}
+/// Appends exactly one block. History is read only from already validated output.
+pub(super) fn decode_append(
+    input: &[u8],
+    expected_size: usize,
+    out: &mut Vec<u8>,
+    solid: bool,
+) -> Result<()> {
     if input.len() > MAX_LZ_SIZE {
         return Err(CodecError::InputLimit);
     }
     if expected_size > BLOCK_SIZE {
         return Err(CodecError::OutputLimit);
     }
-    let mut out = bytes(expected_size)?;
+    let start = out.len();
+    if (solid && start + expected_size > SOLID_WINDOW) || (!solid && start != 0) {
+        return Err(CodecError::OutputLimit);
+    }
+    out.try_reserve_exact(expected_size)
+        .map_err(|_| CodecError::AllocationFailed)?;
+    let end = start + expected_size;
     let mut reader = Reader::new(input);
-    while out.len() < expected_size {
+    while out.len() < end {
         let flags = reader.u8()?;
         for slot in 0..8 {
             if flags & (1 << slot) == 0 {
@@ -504,7 +582,7 @@ pub fn decode(input: &[u8], expected_size: usize) -> Result<Vec<u8>> {
                 let distance = (read_varint(&mut reader)? as usize)
                     .checked_add(1)
                     .ok_or(CodecError::OutputLimit)?;
-                if distance > out.len() || length > expected_size - out.len() {
+                if distance > out.len() || distance > SOLID_WINDOW || length > end - out.len() {
                     return Err(invalid("LZ reference out of bounds"));
                 }
                 if distance >= length {
@@ -522,7 +600,7 @@ pub fn decode(input: &[u8], expected_size: usize) -> Result<Vec<u8>> {
                     }
                 }
             }
-            if out.len() == expected_size {
+            if out.len() == end {
                 if (u16::from(flags) >> (slot + 1)) != 0 {
                     return Err(invalid("nonzero unused LZ flag bits"));
                 }
@@ -531,5 +609,5 @@ pub fn decode(input: &[u8], expected_size: usize) -> Result<Vec<u8>> {
         }
     }
     reader.finish()?;
-    Ok(out)
+    Ok(())
 }
