@@ -11,6 +11,12 @@ use std::collections::BinaryHeap;
 
 pub const MIN_MATCH: usize = 4;
 const NONE: u32 = u32::MAX;
+// A candidate starts at least four bytes before the end of a <=16 MiB input.
+// The spare top byte caches the first input byte, avoiding an unrelated random
+// input load for most hash collisions without dropping any possible match.
+const POSITION_BITS: u32 = SOLID_WINDOW.trailing_zeros();
+const POSITION_MASK: u32 = SOLID_WINDOW as u32 - 1;
+const _: () = assert!(POSITION_BITS == 24);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LzOptions {
     pub hash_bits: u8,
@@ -55,12 +61,58 @@ pub enum Token {
     Match { length: usize, distance: usize },
 }
 
+/// One-sided membership filter: a missing bit proves that no earlier dictionary
+/// position has this four-byte key. Collisions only perform extra normal lookups.
+struct SeenWords {
+    bits: Vec<u64>,
+    mask: usize,
+}
+impl SeenWords {
+    fn new(input_size: usize) -> Result<Self> {
+        let byte_size = input_size.next_power_of_two().max(4096);
+        Ok(Self {
+            bits: vector(byte_size / 8, 0u64)?,
+            mask: byte_size * 8 - 1,
+        })
+    }
+    fn contains(&self, key: u32) -> bool {
+        let bit = key as usize & self.mask;
+        self.bits[bit >> 6] & (1u64 << (bit & 63)) != 0
+    }
+    fn insert(&mut self, key: u32) {
+        let bit = key as usize & self.mask;
+        self.bits[bit >> 6] |= 1u64 << (bit & 63);
+    }
+}
+fn word_key(input: &[u8], position: usize) -> u32 {
+    let b = &input[position..position + 4];
+    u32::from_le_bytes([b[0], b[1], b[2], b[3]]).wrapping_mul(0x9e37_79b1)
+}
+fn use_membership_filter(input: &[u8]) -> bool {
+    if input.len() <= BLOCK_SIZE {
+        return false;
+    }
+    const SAMPLE: usize = 4096;
+    for start in [0, (input.len() - SAMPLE) / 2, input.len() - SAMPLE] {
+        let mut occupied = [0u64; 64];
+        for pos in start..start + SAMPLE - 3 {
+            let bit = (word_key(input, pos) >> 20) as usize;
+            occupied[bit >> 6] |= 1u64 << (bit & 63);
+        }
+        if occupied.iter().map(|v| v.count_ones()).sum::<u32>() > 2048 {
+            return true;
+        }
+    }
+    false
+}
+
 pub struct MatchFinder<'a> {
     input: &'a [u8],
     options: LzOptions,
     heads: Vec<u32>,
     previous: Vec<u32>,
     cursor: usize,
+    seen: Option<SeenWords>,
 }
 impl<'a> MatchFinder<'a> {
     pub fn new(input: &'a [u8], options: LzOptions) -> Result<Self> {
@@ -78,12 +130,12 @@ impl<'a> MatchFinder<'a> {
                 Vec::new()
             },
             cursor: 0,
+            seen: if use_membership_filter(input) {
+                Some(SeenWords::new(input.len())?)
+            } else {
+                None
+            },
         })
-    }
-    fn hash(&self, position: usize) -> usize {
-        let b = &self.input[position..position + 4];
-        let value = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-        (value.wrapping_mul(0x9e37_79b1) >> (32 - self.options.hash_bits)) as usize
     }
     /// Best length for each ULEB128 distance-price class. All positions before
     /// `position` must have been inserted; future bytes are never dictionary entries.
@@ -96,10 +148,14 @@ impl<'a> MatchFinder<'a> {
         if limit < MIN_MATCH {
             return Ok(best);
         }
-        let mut candidate = self.heads[self.hash(position)];
+        let key = word_key(self.input, position);
+        if self.seen.as_ref().is_some_and(|seen| !seen.contains(key)) {
+            return Ok(best);
+        }
+        let mut candidate = self.heads[(key >> (32 - self.options.hash_bits)) as usize];
         let mut examined = 0;
         while candidate != NONE && examined < self.options.chain_depth {
-            let candidate_pos = candidate as usize;
+            let candidate_pos = (candidate & POSITION_MASK) as usize;
             if candidate_pos >= position {
                 return Err(invalid("nondecreasing match chain"));
             }
@@ -107,24 +163,26 @@ impl<'a> MatchFinder<'a> {
             if distance > self.options.window_size {
                 break;
             }
-            let class = varint_size((distance - 1) as u32) - 1;
-            // A candidate cannot improve this distance-price class if it already
-            // differs at the current best length. Avoid re-scanning long prefixes.
-            let known = best[class].length;
-            let length = if known < limit
-                && self.input[position + known] == self.input[candidate_pos + known]
-                && self.input[position..position + MIN_MATCH]
-                    == self.input[candidate_pos..candidate_pos + MIN_MATCH]
-            {
-                common_prefix(
-                    &self.input[position..position + limit],
-                    &self.input[candidate_pos..candidate_pos + limit],
-                )
-            } else {
-                0
-            };
-            if length >= MIN_MATCH && length > best[class].length {
-                best[class] = Match { length, distance };
+            let mut length = 0;
+            if (candidate >> POSITION_BITS) as u8 == self.input[position] {
+                let class = varint_size((distance - 1) as u32) - 1;
+                // A differing byte at the current best length cannot improve
+                // this price class. The cached first byte already matched.
+                let known = best[class].length;
+                if known < limit
+                    && (known == 0
+                        || self.input[position + known] == self.input[candidate_pos + known])
+                    && self.input[position..position + MIN_MATCH]
+                        == self.input[candidate_pos..candidate_pos + MIN_MATCH]
+                {
+                    length = common_prefix(
+                        &self.input[position..position + limit],
+                        &self.input[candidate_pos..candidate_pos + limit],
+                    );
+                }
+                if length >= MIN_MATCH && length > best[class].length {
+                    best[class] = Match { length, distance };
+                }
             }
             if length == limit || self.previous.is_empty() {
                 break;
@@ -139,11 +197,15 @@ impl<'a> MatchFinder<'a> {
             return Err(invalid("nonsequential match insertion"));
         }
         if self.input.len() - position >= MIN_MATCH {
-            let hash = self.hash(position);
+            let key = word_key(self.input, position);
+            let hash = (key >> (32 - self.options.hash_bits)) as usize;
+            if let Some(seen) = &mut self.seen {
+                seen.insert(key);
+            }
             if !self.previous.is_empty() {
                 self.previous[position] = self.heads[hash];
             }
-            self.heads[hash] = position as u32;
+            self.heads[hash] = position as u32 | (u32::from(self.input[position]) << POSITION_BITS);
         }
         self.cursor += 1;
         Ok(())
@@ -610,4 +672,64 @@ pub(super) fn decode_append(
     }
     reader.finish()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod speed_tests {
+    use super::*;
+    #[test]
+    fn membership_filter_has_no_false_negatives_for_inserted_words() {
+        let mut state = 0x9172_41ab_05c3_f099u64;
+        let data: Vec<u8> = (0..BLOCK_SIZE + 4096)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 32) as u8
+            })
+            .collect();
+        assert!(use_membership_filter(&data));
+        let mut finder = MatchFinder::new(&data, LzOptions::default()).unwrap();
+        for pos in 0..data.len() {
+            finder.insert(pos).unwrap();
+            if pos + MIN_MATCH <= data.len() {
+                assert!(finder.seen.as_ref().unwrap().contains(word_key(&data, pos)));
+            }
+        }
+        assert!(!use_membership_filter(&vec![0xff; BLOCK_SIZE + 4096]));
+    }
+    #[test]
+    fn membership_filter_matches_the_unfiltered_finder_with_window_expiry() {
+        let mut state = 0xb273_f182_7431_abc1u64;
+        let mut data: Vec<u8> = (0..BLOCK_SIZE + 511)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 32) as u8
+            })
+            .collect();
+        for pos in (2051..data.len() - 80).step_by(4096) {
+            for j in 0..70 {
+                data[pos + j] = data[pos - 1024 + j];
+            }
+        }
+        let options = LzOptions {
+            hash_bits: 12,
+            chain_depth: 16,
+            window_size: 64 << 10,
+        };
+        let mut filtered = MatchFinder::new(&data, options).unwrap();
+        let mut reference = MatchFinder::new(&data, options).unwrap();
+        assert!(filtered.seen.is_some());
+        reference.seen = None;
+        for pos in 0..data.len() {
+            assert_eq!(
+                filtered.find(pos, 64).unwrap(),
+                reference.find(pos, 64).unwrap()
+            );
+            filtered.insert(pos).unwrap();
+            reference.insert(pos).unwrap();
+        }
+    }
 }

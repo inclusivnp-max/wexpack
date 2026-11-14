@@ -235,6 +235,28 @@ impl Candidate<'_> {
     }
 }
 
+// Partial frames only grow. STORE is the only later alternative that can be
+// smaller than that prefix, so both bounds must fail before rejecting a pass.
+fn finish_candidate(
+    data: &[u8],
+    output: &mut Vec<u8>,
+    budget: Option<usize>,
+) -> Option<Option<CodecType>> {
+    if output.len() >= data.len() {
+        output.clear();
+        if budget.is_some_and(|limit| data.len() > limit) {
+            return Some(None);
+        }
+        output.extend_from_slice(data);
+        return Some(Some(CodecType::Store));
+    }
+    if budget.is_some_and(|limit| output.len() > limit && data.len() > limit) {
+        output.clear();
+        return Some(None);
+    }
+    None
+}
+
 pub struct WexEngine;
 impl WexEngine {
     pub fn compress(data: &[u8], level: u8) -> Result<CompressedChunk> {
@@ -247,21 +269,37 @@ impl WexEngine {
     }
     /// The output buffer can be retained by a worker between chunks.
     pub fn compress_into(data: &[u8], level: u8, output: &mut Vec<u8>) -> Result<CodecType> {
-        Self::compress_frame(data, level, output, false)
+        Self::compress_frame(data, level, output, false, None)?
+            .ok_or_else(|| invalid("unbounded frame aborted"))
     }
     /// WXE revision 2 keeps LZ history across blocks inside a bounded solid frame.
     pub fn compress_solid_into(data: &[u8], level: u8, output: &mut Vec<u8>) -> Result<CodecType> {
         if data.len() > lz::SOLID_WINDOW {
             return Err(CodecError::InputLimit);
         }
-        Self::compress_frame(data, level, output, true)
+        Self::compress_frame(data, level, output, true, None)?
+            .ok_or_else(|| invalid("unbounded frame aborted"))
+    }
+    /// Returns None only when neither the partial frame nor STORE can fit the
+    /// inclusive byte budget. No partial output survives an aborted candidate.
+    pub fn compress_solid_bounded_into(
+        data: &[u8],
+        level: u8,
+        output: &mut Vec<u8>,
+        max_size: usize,
+    ) -> Result<Option<CodecType>> {
+        if data.len() > lz::SOLID_WINDOW {
+            return Err(CodecError::InputLimit);
+        }
+        Self::compress_frame(data, level, output, true, Some(max_size))
     }
     fn compress_frame(
         data: &[u8],
         level: u8,
         output: &mut Vec<u8>,
         solid: bool,
-    ) -> Result<CodecType> {
+        budget: Option<usize>,
+    ) -> Result<Option<CodecType>> {
         let level = CompressionLevel::new(level)?;
         if data.len() > MAX_STORED_CHUNK_SIZE as usize {
             return Err(CodecError::InputLimit);
@@ -273,7 +311,7 @@ impl WexEngine {
             .try_reserve_exact(capacity)
             .map_err(|_| CodecError::AllocationFailed)?;
         if data.is_empty() {
-            return Ok(CodecType::Store);
+            return Ok(Some(CodecType::Store));
         }
         output.extend_from_slice(if solid { b"WXE\x02" } else { b"WXE\x01" });
         output.extend([level.codec() as u8, level.get(), 0, 0]);
@@ -282,6 +320,9 @@ impl WexEngine {
         output.extend_from_slice(&crc32fast::hash(data).to_le_bytes());
         let header_crc = crc32fast::hash(output);
         output.extend_from_slice(&header_crc.to_le_bytes());
+        if let Some(result) = finish_candidate(data, output, budget) {
+            return Ok(result);
+        }
         let (mode, options) = level.lz();
         let mut solid_finder = if solid {
             let mut solid_options = options;
@@ -331,14 +372,11 @@ impl WexEngine {
             output.extend_from_slice(&(best.payload.len() as u32).to_le_bytes());
             output.extend_from_slice(&crc32fast::hash(block).to_le_bytes());
             output.extend_from_slice(&best.payload);
+            if let Some(result) = finish_candidate(data, output, budget) {
+                return Ok(result);
+            }
         }
-        if output.len() >= data.len() {
-            output.clear();
-            output.extend_from_slice(data);
-            Ok(CodecType::Store)
-        } else {
-            Ok(level.codec())
-        }
+        Ok(Some(level.codec()))
     }
     pub fn decompress(data: &[u8], codec: CodecType, expected_size: usize) -> Result<Vec<u8>> {
         let mut out = Vec::new();

@@ -218,27 +218,50 @@ fn compress(mut job: Job, level: u8, solid: bool) -> Result<Finished> {
     let mut transform = prepared.transform;
     let mut transformed_size = prepared.data.len();
     let codec = if solid {
-        // High entropy in a sample says nothing about matches in earlier files.
-        // Compare identity with the selected transform before retaining that transform.
-        let mut identity = Vec::new();
-        let identity_codec = WexEngine::compress_solid_into(raw, level, &mut identity)?;
-        if prepared.transform != TransformType::None && prepared.data.len() <= MAX_SOLID_GROUP_SIZE
+        // Word substitution often loses to the large raw LZ history. Numeric
+        // shuffles and BCJ go first instead. Both orders retain the same winner:
+        // a losing second pass stops only at a proven append-only size bound.
+        if prepared.transform == TransformType::DictWord
+            && prepared.data.len() <= MAX_SOLID_GROUP_SIZE
         {
-            let filtered_codec =
-                WexEngine::compress_solid_into(&prepared.data, level, &mut buffers.output)?;
-            if buffers.output.len() < identity.len() {
+            let identity_codec = WexEngine::compress_solid_into(raw, level, &mut buffers.output)?;
+            let mut filtered = Vec::new();
+            if let Some(filtered_codec) = WexEngine::compress_solid_bounded_into(
+                &prepared.data,
+                level,
+                &mut filtered,
+                buffers.output.len().saturating_sub(1),
+            )? {
+                buffers.output = filtered;
                 filtered_codec
             } else {
-                buffers.output = identity;
                 transform = TransformType::None;
                 transformed_size = raw.len();
                 identity_codec
             }
+        } else if prepared.transform != TransformType::None
+            && prepared.data.len() <= MAX_SOLID_GROUP_SIZE
+        {
+            let filtered_codec =
+                WexEngine::compress_solid_into(&prepared.data, level, &mut buffers.output)?;
+            let mut identity = Vec::new();
+            if let Some(identity_codec) = WexEngine::compress_solid_bounded_into(
+                raw,
+                level,
+                &mut identity,
+                buffers.output.len(),
+            )? {
+                buffers.output = identity;
+                transform = TransformType::None;
+                transformed_size = raw.len();
+                identity_codec
+            } else {
+                filtered_codec
+            }
         } else {
-            buffers.output = identity;
             transform = TransformType::None;
             transformed_size = raw.len();
-            identity_codec
+            WexEngine::compress_solid_into(raw, level, &mut buffers.output)?
         }
     } else if prepared.bypass_compression {
         buffers.output.clear();
@@ -351,7 +374,7 @@ pub fn pack(
         cdc.max_size()
     };
     let scratch = if options.solid {
-        136 << 20
+        152 << 20
     } else if options.level >= 4 {
         32 << 20
     } else {
