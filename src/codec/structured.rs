@@ -214,25 +214,27 @@ fn packed_kinds(data: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 fn stream(data: &[u8], kinds: bool) -> Result<(Vec<u8>, bool, [u32; 256])> {
+    let raw_len = if kinds {
+        data.len().div_ceil(8)
+    } else {
+        data.len()
+    };
+    let mut costs = [if kinds { SCALE } else { 8 * SCALE }; 256];
+    if !data.is_empty() {
+        let (coded, frequencies) = ans::encode_model(data)?;
+        if coded.len() < raw_len {
+            for i in 0..256 {
+                costs[i] = price(frequencies[i]);
+            }
+            return Ok((coded, true, costs));
+        }
+    }
     let raw = if kinds {
         packed_kinds(data)?
     } else {
         data.to_vec()
     };
-    let mut costs = [if kinds { SCALE } else { 8 * SCALE }; 256];
-    if data.is_empty() {
-        return Ok((raw, false, costs));
-    }
-    let coded = ans::encode(data)?;
-    if coded.len() < raw.len() {
-        let f = ans::normalized_frequencies(data)?;
-        for i in 0..256 {
-            costs[i] = price(f[i]);
-        }
-        Ok((coded, true, costs))
-    } else {
-        Ok((raw, false, costs))
-    }
+    Ok((raw, false, costs))
 }
 pub(super) struct Encoded {
     pub data: Vec<u8>,
@@ -248,15 +250,87 @@ pub(super) fn encode_context(
     range: Range<usize>,
     tokens: &[Token],
 ) -> Result<Encoded> {
-    let mut best = encode_mode(input, range.clone(), tokens, Some(0))?;
+    // Context choice changes only the literal package. Keep all other streams,
+    // including their normalized prices, from the single mode-0 encoding.
+    let mut base = encode_mode(input, range.clone(), tokens, Some(0))?;
+    let mut header = Reader::new(&base.data);
+    header.take(12)?;
+    let literal_count = header.u32()? as usize;
+    header.take(8)?;
+    let literal_start = HEADER + header.u32()? as usize;
+    let literal_size = header.u32()? as usize;
+    let literal_end = literal_start + literal_size;
+    let mut records = Vec::new();
+    records
+        .try_reserve_exact(literal_count)
+        .map_err(|_| CodecError::AllocationFailed)?;
+    let mut pos = range.start;
+    for token in tokens {
+        if token.distance == 0 {
+            records.push([
+                input[pos],
+                pos.checked_sub(1).map_or(0, |p| input[p]),
+                (pos & 3) as u8,
+            ]);
+        }
+        pos += token.length as usize;
+    }
+    let mut best_size = literal_size;
+    let mut best = None;
     for mode in 1..=4 {
-        let next = encode_mode(input, range.clone(), tokens, Some(mode))?;
-        if next.data.len() < best.data.len() {
-            best = next;
+        let count = banks(mode)?;
+        let mut values: [Vec<u8>; 16] = std::array::from_fn(|_| Vec::new());
+        for &[value, previous, position] in &records {
+            let v = &mut values[bank(mode, position as usize, previous)];
+            if v.len() == v.capacity() {
+                v.try_reserve(1).map_err(|_| CodecError::AllocationFailed)?;
+            }
+            v.push(value);
+        }
+        let (data, prices) = literal_package(&values[..count])?;
+        if data.len() < best_size {
+            best_size = data.len();
+            best = Some((mode, data, prices));
         }
     }
-    Ok(best)
+    if let Some((mode, data, prices)) = best {
+        // The winning package is smaller: move the unchanged suffix left in
+        // place, with no new allocation and exactly the original tie order.
+        let size = base.data.len() - literal_size + data.len();
+        base.data
+            .copy_within(literal_end.., literal_start + data.len());
+        base.data.truncate(size);
+        base.data[literal_start..literal_start + data.len()].copy_from_slice(&data);
+        base.data[5] = mode;
+        base.data[28..32].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        base.prices.context = mode;
+        base.prices.literal = prices;
+    }
+    Ok(base)
 }
+fn literal_package(values: &[Vec<u8>]) -> Result<(Vec<u8>, [[u32; 256]; 16])> {
+    let count = values.len();
+    let mut payload = bytes(4 + 12 * count + values.iter().map(Vec::len).sum::<usize>())?;
+    payload.extend([count as u8, 0, 0, 0]);
+    let mut encoded = Vec::new();
+    encoded
+        .try_reserve_exact(count)
+        .map_err(|_| CodecError::AllocationFailed)?;
+    let mut prices = [[8 * SCALE; 256]; 16];
+    for (i, value) in values.iter().enumerate() {
+        let (data, coded, costs) = stream(value, false)?;
+        prices[i] = costs;
+        payload.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        payload.extend([u8::from(coded), 0, 0, 0]);
+        encoded.push(data);
+    }
+    for data in encoded {
+        payload.extend_from_slice(&data);
+    }
+    Ok((payload, prices))
+}
+
 fn encode_mode(
     input: &[u8],
     range: Range<usize>,
@@ -319,21 +393,7 @@ fn encode_mode(
     exact(pos, range.end)?;
     let (kind, kc, kp) = stream(&kinds, true)?;
     let (literal, lc, lp) = if context.is_some() {
-        let mut payload = bytes(4 + 12 * bank_count + literals.len() + bank_count * 520)?;
-        payload.extend([bank_count as u8, 0, 0, 0]);
-        let mut encoded = Vec::new();
-        let mut prices = [[8 * SCALE; 256]; 16];
-        for i in 0..bank_count {
-            let (data, coded, costs) = stream(&literal_banks[i], false)?;
-            prices[i] = costs;
-            payload.extend_from_slice(&(literal_banks[i].len() as u32).to_le_bytes());
-            payload.extend_from_slice(&(data.len() as u32).to_le_bytes());
-            payload.extend([u8::from(coded), 0, 0, 0]);
-            encoded.push(data);
-        }
-        for data in encoded {
-            payload.extend_from_slice(&data);
-        }
+        let (payload, prices) = literal_package(&literal_banks[..bank_count])?;
         (payload, false, prices)
     } else {
         let (data, coded, costs) = stream(&literals, false)?;
@@ -640,14 +700,15 @@ fn fast_parse(
                 if m.length < 4 {
                     continue;
                 }
-                for length in (0..=17)
-                    .map(|s| ((1usize << (s + 1)) - 1) + 3)
-                    .chain([m.length])
-                    .filter(|&n| n <= m.length)
+                let last_slot = slot((m.length - 3) as u32);
+                let distance_cost = prices.kind[1] + prices.distance(m.distance, recent);
+                for (s, length) in (0..last_slot)
+                    .map(|s| (s, ((1usize << (s + 1)) - 1) + 3))
+                    .chain([(last_slot, m.length)])
                 {
                     let literal =
                         prefix[position - range.start + length] - prefix[position - range.start];
-                    let cost = prices.matched(length, m.distance, recent);
+                    let cost = distance_cost + prices.length[s as usize] + u32::from(s) * SCALE;
                     let gain = literal.saturating_sub(cost);
                     if gain > saving || (gain == saving && gain > 0 && length > best.length) {
                         saving = gain;
@@ -663,11 +724,25 @@ fn fast_parse(
     let mut tokens = Vec::new();
     let mut pos = range.start;
     let mut last = Recent::default();
+    let mut cached = None;
     while pos < range.end {
-        let (current, gain) = choose(pos, last, finder)?;
+        let (current, gain) = match cached.take() {
+            Some(next) => next,
+            None => choose(pos, last, finder)?,
+        };
         finder.insert(pos)?;
         if current.length >= 4 {
-            if pos + 1 < range.end && choose(pos + 1, last, finder)?.1 > gain {
+            let next = if pos + 1 < range.end {
+                Some(choose(pos + 1, last, finder)?)
+            } else {
+                None
+            };
+            if let Some(next) = next
+                && next.1 > gain
+            {
+                // Inserting the literal and leaving the recent cache untouched
+                // makes the next loop's dictionary/model exactly this lookahead.
+                cached = Some(next);
                 append(
                     &mut tokens,
                     Token {
@@ -848,6 +923,317 @@ pub(super) fn parse(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn reference_encode_mode(
+        input: &[u8],
+        range: Range<usize>,
+        tokens: &[Token],
+        context: Option<u8>,
+    ) -> Result<Encoded> {
+        if range.len() > BLOCK_SIZE || range.end > input.len() || tokens.len() > range.len() {
+            return Err(CodecError::InputLimit);
+        }
+        let mut kinds = bytes(tokens.len())?;
+        let mut literals = bytes(range.len())?;
+        let mode = context.unwrap_or(0);
+        let bank_count = banks(mode)?;
+        let mut literal_banks: [Vec<u8>; 16] = std::array::from_fn(|_| Vec::new());
+        let mut lengths = bytes(range.len() / 4)?;
+        let mut distances = bytes(range.len() / 4)?;
+        let mut bits = Bits::new();
+        let mut pos = range.start;
+        let mut recent = Recent::default();
+        for t in tokens {
+            let n = t.length as usize;
+            if n == 0 || n > range.end - pos {
+                return Err(invalid("split token range"));
+            }
+            if t.distance == 0 {
+                if n != 1 {
+                    return Err(invalid("split literal length"));
+                }
+                kinds.push(0);
+                literals.push(input[pos]);
+                if context.is_some() {
+                    let previous = pos.checked_sub(1).map_or(0, |p| input[p]);
+                    let v = &mut literal_banks[bank(mode, pos, previous)];
+                    if v.len() == v.capacity() {
+                        v.try_reserve(1).map_err(|_| CodecError::AllocationFailed)?;
+                    }
+                    v.push(input[pos]);
+                }
+            } else {
+                if n < 4 || t.distance as usize > pos || t.distance as usize > lz::SOLID_WINDOW {
+                    return Err(invalid("split match distance"));
+                }
+                kinds.push(1);
+                let value = t.length - 3;
+                let s = slot(value);
+                lengths.push(s);
+                bits.put(value - (1 << s), s)?;
+                let repeats = if context.is_some() { 4 } else { 1 };
+                if let Some(i) = recent.0[..repeats].iter().position(|&d| d == t.distance) {
+                    distances.push(i as u8);
+                } else {
+                    let s = slot(t.distance);
+                    distances.push(s + repeats as u8);
+                    bits.put(t.distance - (1 << s), s)?;
+                }
+                recent.touch(t.distance);
+            }
+            pos += n;
+        }
+        exact(pos, range.end)?;
+        let (kind, kc, kp) = stream(&kinds, true)?;
+        let (literal, lc, lp) = if context.is_some() {
+            let mut payload = bytes(4 + 12 * bank_count + literals.len() + bank_count * 520)?;
+            payload.extend([bank_count as u8, 0, 0, 0]);
+            let mut encoded = Vec::new();
+            let mut prices = [[8 * SCALE; 256]; 16];
+            for i in 0..bank_count {
+                let (data, coded, costs) = stream(&literal_banks[i], false)?;
+                prices[i] = costs;
+                payload.extend_from_slice(&(literal_banks[i].len() as u32).to_le_bytes());
+                payload.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                payload.extend([u8::from(coded), 0, 0, 0]);
+                encoded.push(data);
+            }
+            for data in encoded {
+                payload.extend_from_slice(&data);
+            }
+            (payload, false, prices)
+        } else {
+            let (data, coded, costs) = stream(&literals, false)?;
+            let mut prices = [[8 * SCALE; 256]; 16];
+            prices[0] = costs;
+            (data, coded, prices)
+        };
+        let (length, nc, np) = stream(&lengths, false)?;
+        let (distance, dc, dp) = stream(&distances, false)?;
+        let mut out = bytes(
+            HEADER + kind.len() + literal.len() + length.len() + distance.len() + bits.data.len(),
+        )?;
+        out.extend_from_slice(if context.is_some() {
+            b"WXS\x02"
+        } else {
+            b"WXS\x01"
+        });
+        out.push(u8::from(kc) | (u8::from(lc) << 1) | (u8::from(nc) << 2) | (u8::from(dc) << 3));
+        out.extend([mode, 0, 0]);
+        for n in [
+            tokens.len(),
+            literals.len(),
+            lengths.len(),
+            bits.count,
+            kind.len(),
+            literal.len(),
+            length.len(),
+            distance.len(),
+            bits.data.len(),
+        ] {
+            out.extend_from_slice(&(n as u32).to_le_bytes());
+        }
+        out.extend_from_slice(&kind);
+        out.extend_from_slice(&literal);
+        out.extend_from_slice(&length);
+        out.extend_from_slice(&distance);
+        out.extend_from_slice(&bits.data);
+        Ok(Encoded {
+            data: out,
+            tokens: tokens.len(),
+            matches: lengths.len(),
+            prices: Prices {
+                kind: [kp[0], kp[1]],
+                literal: lp,
+                context: mode,
+                contextual: context.is_some(),
+                length: np,
+                distance: dp,
+            },
+        })
+    }
+    fn reference_fast_parse(
+        finder: &mut MatchFinder<'_>,
+        range: Range<usize>,
+        prices: &Prices,
+    ) -> Result<Vec<Token>> {
+        let input = finder.source();
+        let mut prefix = vector(range.len() + 1, 0u32)?;
+        for i in 0..range.len() {
+            prefix[i + 1] = prefix[i] + prices.literal(input, range.start + i);
+        }
+        let choose = |position: usize,
+                      recent: Recent,
+                      finder: &MatchFinder<'_>|
+         -> Result<(lz::Match, u32)> {
+            let (candidates, count) =
+                prices.candidates(finder, position, range.end - position, recent)?;
+            let mut best = lz::Match::default();
+            let mut saving = 0;
+            for &m in &candidates[..count] {
+                if m.length < 4 {
+                    continue;
+                }
+                for length in (0..=17)
+                    .map(|s| ((1usize << (s + 1)) - 1) + 3)
+                    .chain([m.length])
+                    .filter(|&n| n <= m.length)
+                {
+                    let literal =
+                        prefix[position - range.start + length] - prefix[position - range.start];
+                    let cost = prices.matched(length, m.distance, recent);
+                    let gain = literal.saturating_sub(cost);
+                    if gain > saving || (gain == saving && gain > 0 && length > best.length) {
+                        saving = gain;
+                        best = lz::Match {
+                            length,
+                            distance: m.distance,
+                        };
+                    }
+                }
+            }
+            Ok((best, saving))
+        };
+        let mut tokens = Vec::new();
+        let mut pos = range.start;
+        let mut last = Recent::default();
+        while pos < range.end {
+            let (current, gain) = choose(pos, last, finder)?;
+            finder.insert(pos)?;
+            if current.length >= 4 {
+                if pos + 1 < range.end && choose(pos + 1, last, finder)?.1 > gain {
+                    append(
+                        &mut tokens,
+                        Token {
+                            length: 1,
+                            distance: 0,
+                        },
+                    )?;
+                    pos += 1;
+                    continue;
+                }
+                append(
+                    &mut tokens,
+                    Token {
+                        length: current.length as u32,
+                        distance: current.distance as u32,
+                    },
+                )?;
+                pos += current.length;
+                finder.advance_to(pos)?;
+                last.touch(current.distance as u32);
+            } else {
+                append(
+                    &mut tokens,
+                    Token {
+                        length: 1,
+                        distance: 0,
+                    },
+                )?;
+                pos += 1;
+            }
+        }
+        Ok(tokens)
+    }
+    fn assert_same_encoding(a: &Encoded, b: &Encoded) {
+        assert_eq!(a.data, b.data);
+        assert_eq!(a.tokens, b.tokens);
+        assert_eq!(a.matches, b.matches);
+        assert_eq!(a.prices.kind, b.prices.kind);
+        assert_eq!(a.prices.length, b.prices.length);
+        assert_eq!(a.prices.distance, b.prices.distance);
+        assert_eq!(a.prices.literal, b.prices.literal);
+        assert_eq!(a.prices.context, b.prices.context);
+        assert_eq!(a.prices.contextual, b.prices.contextual);
+    }
+    #[test]
+    fn shared_context_streams_match_frozen_five_pass_encoder_byte_for_byte() {
+        let mut state = 0x1234_5678_9abc_def0u64;
+        let mut noise = Vec::new();
+        for _ in 0..8192 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            noise.push((state >> 32) as u8);
+        }
+        for data in [
+            vec![],
+            vec![b'a'],
+            b"a1! a2? b3: c4;".repeat(200),
+            noise,
+            include_bytes!("lz.rs").to_vec(),
+        ] {
+            let tokens = vec![
+                Token {
+                    length: 1,
+                    distance: 0
+                };
+                data.len()
+            ];
+            let mut choices = vec![(0..data.len(), tokens)];
+            if data.len() >= MIN_MATCH {
+                let mut finder = MatchFinder::new(&data, lz::LzOptions::default()).unwrap();
+                let raw = lz::encode_solid_block(&mut finder, 0..data.len(), lz::ParseMode::Lazy)
+                    .unwrap();
+                choices.push((0..data.len(), seed(&raw, data.len()).unwrap()));
+            }
+            if data.len() > 100 {
+                choices.push((
+                    37..data.len(),
+                    vec![
+                        Token {
+                            length: 1,
+                            distance: 0
+                        };
+                        data.len() - 37
+                    ],
+                ));
+            }
+            for (range, tokens) in choices {
+                for mode in [None, Some(0), Some(1), Some(2), Some(3), Some(4)] {
+                    assert_same_encoding(
+                        &encode_mode(&data, range.clone(), &tokens, mode).unwrap(),
+                        &reference_encode_mode(&data, range.clone(), &tokens, mode).unwrap(),
+                    );
+                }
+                let mut expected =
+                    reference_encode_mode(&data, range.clone(), &tokens, Some(0)).unwrap();
+                for mode in 1..=4 {
+                    let next =
+                        reference_encode_mode(&data, range.clone(), &tokens, Some(mode)).unwrap();
+                    if next.data.len() < expected.data.len() {
+                        expected = next;
+                    }
+                }
+                assert_same_encoding(&encode_context(&data, range, &tokens).unwrap(), &expected);
+            }
+        }
+    }
+    #[test]
+    fn cached_lazy_parser_and_length_slots_match_frozen_parser_tokens() {
+        let data = include_bytes!("lz.rs")[..12000].repeat(2);
+        for level in [4, 5, 7] {
+            let (_, options) = super::super::CompressionLevel::new(level).unwrap().lz();
+            let mut finder = MatchFinder::new(&data, options).unwrap();
+            let raw =
+                lz::encode_solid_block(&mut finder, 0..data.len(), lz::ParseMode::Lazy).unwrap();
+            let seed = seed(&raw, data.len()).unwrap();
+            for mode in [None, Some(0), Some(1), Some(2), Some(3), Some(4)] {
+                let model = reference_encode_mode(&data, 0..data.len(), &seed, mode).unwrap();
+                for start in [0, 37] {
+                    finder.rewind_to(start).unwrap();
+                    let expected =
+                        reference_fast_parse(&mut finder, start..data.len(), &model.prices)
+                            .unwrap();
+                    finder.rewind_to(start).unwrap();
+                    let actual = fast_parse(&mut finder, start..data.len(), &model.prices).unwrap();
+                    assert_eq!(
+                        actual, expected,
+                        "level {level}, mode {mode:?}, start {start}"
+                    );
+                }
+            }
+        }
+    }
     #[test]
     fn contextual_wire_golden_has_explicit_bank_counts_and_order() {
         let tokens = [Token {

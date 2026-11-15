@@ -43,6 +43,11 @@ pub fn normalized_frequencies(input: &[u8]) -> Result<[u16; 256]> {
     Ok(frequencies)
 }
 pub fn encode(input: &[u8]) -> Result<Vec<u8>> {
+    encode_model(input).map(|(data, _)| data)
+}
+/// Return the exact normalized model used on the wire, so pricing does not
+/// scan and normalize the same bytes a second time.
+pub(super) fn encode_model(input: &[u8]) -> Result<(Vec<u8>, [u16; 256])> {
     let frequencies = normalized_frequencies(input)?;
     let mut cumulative = [0u32; 256];
     let mut total = 0;
@@ -77,7 +82,7 @@ pub fn encode(input: &[u8]) -> Result<Vec<u8>> {
     }
     out.extend_from_slice(&state.to_le_bytes());
     out.extend(emitted.into_iter().rev());
-    Ok(out)
+    Ok((out, frequencies))
 }
 pub fn decode(input: &[u8], expected_size: usize) -> Result<Vec<u8>> {
     if input.len() > MAX_FRAME {
