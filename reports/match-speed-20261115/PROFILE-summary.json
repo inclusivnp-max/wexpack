@@ -1,0 +1,52 @@
+{
+  "byte_identical": true,
+  "stage_intervals_ns": {
+    "seed": 7913132970,
+    "entropy_lz": 123762219,
+    "entropy_raw": 250724981,
+    "split_seed": 376054304,
+    "split_parse": 10239180468,
+    "split_encode": 366624251,
+    "context_seed": 669444209,
+    "context_parse": 12102342443,
+    "context_encode": 675272267,
+    "context_split_encode": 362821218
+  },
+  "stage_fraction": {
+    "seed": 0.23921663328054546,
+    "entropy_lz": 0.003741372913705702,
+    "entropy_raw": 0.007579499303440712,
+    "split_seed": 0.01136824629063939,
+    "split_parse": 0.30953382034560706,
+    "split_encode": 0.011083172661917452,
+    "context_seed": 0.020237520392145998,
+    "context_parse": 0.3658578245807882,
+    "context_encode": 0.02041370451777731,
+    "context_split_encode": 0.01096820571343272
+  },
+  "sampled_lookups": {
+    "0": {
+      "calls": 89376974,
+      "samples": 351201,
+      "ns": 9149543,
+      "estimate_ns": 2328463090.886066
+    },
+    "1": {
+      "calls": 35964845,
+      "samples": 140286,
+      "ns": 60604571,
+      "estimate_ns": 15540425145.44413
+    },
+    "2": {
+      "calls": 17895275,
+      "samples": 69706,
+      "ns": 33232736,
+      "estimate_ns": 8535030012.377183
+    }
+  },
+  "sampling_probability": 0.00390625,
+  "clock": "Instant monotonic elapsed, inclusive per stage/lookup; not CPU time",
+  "baseline_commit": "6d033bbe1b24ffc7fdae1b203a89dcec83f591c7",
+  "dataset": "binaries",
+  "caveat": "Instrumented diagnostic build only. Inclusive elapsed intervals overlap across worker threads; sampling adds overhead and can change code generation. Not CPU-time or before/after performance evidence."
+}

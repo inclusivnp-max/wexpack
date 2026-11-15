@@ -112,6 +112,9 @@ pub struct MatchFinder<'a> {
     heads: Vec<u32>,
     previous: Vec<u32>,
     cursor: usize,
+    // Immutable chains already built by an earlier pass. This watermark is
+    // advanced at rewind, not on every sequential insertion.
+    replay_end: usize,
     seen: Option<SeenWords>,
 }
 impl<'a> MatchFinder<'a> {
@@ -130,6 +133,7 @@ impl<'a> MatchFinder<'a> {
                 Vec::new()
             },
             cursor: 0,
+            replay_end: 0,
             seen: if use_membership_filter(input) {
                 Some(SeenWords::new(input.len())?)
             } else {
@@ -140,24 +144,29 @@ impl<'a> MatchFinder<'a> {
     pub(super) fn source(&self) -> &'a [u8] {
         self.input
     }
-    /// Undo a block in reverse insertion order. Old membership bits may remain:
-    /// they only cause false positives, never future dictionary references.
+    /// Replay historical chains without restoring hash heads or rewriting links.
+    /// previous[pos] is exactly the head that existed before pos was inserted.
     pub(super) fn rewind_to(&mut self, start: usize) -> Result<()> {
         if start > self.cursor || self.previous.is_empty() {
             return Err(invalid("LZ rewind range"));
         }
-        while self.cursor > start {
-            self.cursor -= 1;
-            let pos = self.cursor;
-            if self.input.len() - pos >= MIN_MATCH {
-                let hash = (word_key(self.input, pos) >> (32 - self.options.hash_bits)) as usize;
-                if (self.heads[hash] & POSITION_MASK) as usize != pos {
-                    return Err(invalid("LZ rewind chain"));
-                }
-                self.heads[hash] = self.previous[pos];
+        self.replay_end = self.replay_end.max(self.cursor);
+        self.cursor = start;
+        Ok(())
+    }
+    #[inline]
+    fn first_candidate(&self, position: usize) -> u32 {
+        if position < self.replay_end {
+            // Rewind is permitted only when this full input-sized table exists.
+            self.previous[position]
+        } else {
+            let key = word_key(self.input, position);
+            if self.seen.as_ref().is_some_and(|seen| !seen.contains(key)) {
+                NONE
+            } else {
+                self.heads[(key >> (32 - self.options.hash_bits)) as usize]
             }
         }
-        Ok(())
     }
     pub(super) fn at_distance(
         &self,
@@ -193,11 +202,7 @@ impl<'a> MatchFinder<'a> {
         if limit < MIN_MATCH {
             return Ok(best);
         }
-        let key = word_key(self.input, position);
-        if self.seen.as_ref().is_some_and(|seen| !seen.contains(key)) {
-            return Ok(best);
-        }
-        let mut candidate = self.heads[(key >> (32 - self.options.hash_bits)) as usize];
+        let mut candidate = self.first_candidate(position);
         let mut examined = 0;
         while candidate != NONE && examined < self.options.chain_depth {
             let candidate_pos = (candidate & POSITION_MASK) as usize;
@@ -248,11 +253,7 @@ impl<'a> MatchFinder<'a> {
         if limit < MIN_MATCH {
             return Ok(best);
         }
-        let key = word_key(self.input, position);
-        if self.seen.as_ref().is_some_and(|seen| !seen.contains(key)) {
-            return Ok(best);
-        }
-        let mut candidate = self.heads[(key >> (32 - self.options.hash_bits)) as usize];
+        let mut candidate = self.first_candidate(position);
         let mut examined = 0;
         while candidate != NONE && examined < self.options.chain_depth {
             let candidate_pos = (candidate & POSITION_MASK) as usize;
@@ -296,6 +297,10 @@ impl<'a> MatchFinder<'a> {
         if position != self.cursor || position >= self.input.len() {
             return Err(invalid("nonsequential match insertion"));
         }
+        if position < self.replay_end {
+            self.cursor += 1;
+            return Ok(());
+        }
         if self.input.len() - position >= MIN_MATCH {
             let key = word_key(self.input, position);
             let hash = (key >> (32 - self.options.hash_bits)) as usize;
@@ -313,6 +318,9 @@ impl<'a> MatchFinder<'a> {
     pub(super) fn advance_to(&mut self, end: usize) -> Result<()> {
         if end > self.input.len() || end < self.cursor {
             return Err(invalid("match insertion range"));
+        }
+        if self.cursor < self.replay_end {
+            self.cursor = end.min(self.replay_end);
         }
         while self.cursor < end {
             self.insert(self.cursor)?;
@@ -777,6 +785,215 @@ pub(super) fn decode_append(
 #[cfg(test)]
 mod speed_tests {
     use super::*;
+    #[test]
+    fn replay_preserves_every_match_matrix_and_never_rewrites_chains() {
+        let input =
+            b"some repeated source code with changed suffixes and shared dictionary\n".repeat(100);
+        let mut f = MatchFinder::new(
+            &input,
+            LzOptions {
+                hash_bits: 8,
+                chain_depth: 64,
+                window_size: 4096,
+            },
+        )
+        .unwrap();
+        let mut expected = Vec::new();
+        for pos in 0..input.len() {
+            expected.push((
+                f.find(pos, 71).unwrap(),
+                f.find_priced(pos, 71).unwrap(),
+                f.at_distance(pos, 71, 7).unwrap(),
+            ));
+            f.insert(pos).unwrap();
+        }
+        let heads = f.heads.clone();
+        let links = f.previous.clone();
+        for start in [37, 0, 123, 0] {
+            f.rewind_to(start).unwrap();
+            for (pos, (a, b, c)) in expected.iter().enumerate().skip(start) {
+                assert_eq!(f.find(pos, 71).unwrap(), *a);
+                assert_eq!(f.find_priced(pos, 71).unwrap(), *b);
+                assert_eq!(f.at_distance(pos, 71, 7).unwrap(), *c);
+                f.insert(pos).unwrap();
+            }
+            assert_eq!(f.heads, heads);
+            assert_eq!(f.previous, links);
+        }
+    }
+    #[test]
+    fn partial_replay_then_live_extension_matches_a_fresh_dictionary() {
+        let input = b"repeated test value with prefix and suffix;\n".repeat(200);
+        let options = LzOptions {
+            hash_bits: 8,
+            chain_depth: 16,
+            window_size: 4096,
+        };
+        let mut f = MatchFinder::new(&input, options).unwrap();
+        f.advance_to(2000).unwrap();
+        let heads = f.heads.clone();
+        let links = f.previous.clone();
+        for (start, end) in [
+            (37, 1500),
+            (100, 3500),
+            (2000, 3000),
+            (37, 4000),
+            (3999, input.len()),
+        ] {
+            f.rewind_to(start).unwrap();
+            f.advance_to(end).unwrap();
+            let mut reference = MatchFinder::new(&input, options).unwrap();
+            reference.advance_to(end).unwrap();
+            assert_eq!(f.find(end, 71).unwrap(), reference.find(end, 71).unwrap());
+            assert_eq!(
+                f.find_priced(end, 71).unwrap(),
+                reference.find_priced(end, 71).unwrap()
+            );
+            if end == 1500 {
+                assert_eq!(f.heads, heads);
+                assert_eq!(f.previous, links);
+            }
+        }
+        assert!(f.rewind_to(input.len() + 1).is_err());
+    }
+    #[test]
+    fn historical_priced_heads_match_an_independent_scalar_chain_oracle() {
+        let input: Vec<u8> = (0..6007)
+            .map(|i| ((i * 1337 + i / 11) >> 3) as u8)
+            .collect();
+        for options in [
+            LzOptions {
+                hash_bits: 8,
+                chain_depth: 64,
+                window_size: 4096,
+            },
+            LzOptions {
+                hash_bits: 16,
+                chain_depth: 16,
+                window_size: SOLID_WINDOW,
+            },
+        ] {
+            let mut f = MatchFinder::new(&input, options).unwrap();
+            let mut heads = vec![usize::MAX; 1 << options.hash_bits];
+            let mut links = vec![usize::MAX; input.len()];
+            let mut saved = Vec::new();
+            for pos in 0..input.len() {
+                let limit = 67.min(input.len() - pos);
+                let mut best = [Match::default(); 25];
+                if limit >= 4 {
+                    let hash = (word_key(&input, pos) >> (32 - options.hash_bits)) as usize;
+                    let mut candidate = heads[hash];
+                    let mut examined = 0;
+                    while candidate != usize::MAX && examined < options.chain_depth {
+                        let d = pos - candidate;
+                        if d > options.window_size {
+                            break;
+                        }
+                        let length = input[pos..pos + limit]
+                            .iter()
+                            .zip(&input[candidate..candidate + limit])
+                            .take_while(|(a, b)| a == b)
+                            .count();
+                        let class = (usize::BITS - 1 - d.leading_zeros()) as usize;
+                        if length >= 4 && length > best[class].length {
+                            best[class] = Match {
+                                length,
+                                distance: d,
+                            };
+                        }
+                        candidate = links[candidate];
+                        examined += 1;
+                    }
+                    links[pos] = heads[hash];
+                    heads[hash] = pos;
+                }
+                assert_eq!(f.find_priced(pos, 67).unwrap(), best);
+                saved.push(best);
+                f.insert(pos).unwrap();
+            }
+            for start in [37, 0] {
+                f.rewind_to(start).unwrap();
+                for (pos, best) in saved.iter().enumerate().skip(start) {
+                    f.advance_to(pos).unwrap();
+                    assert_eq!(f.find_priced(pos, 67).unwrap(), *best);
+                }
+                f.advance_to(input.len()).unwrap();
+            }
+        }
+    }
+    #[test]
+    fn replay_handles_membership_filters_and_the_last_ff_tagged_position() {
+        let mut data = vec![0u8; BLOCK_SIZE + 4007];
+        let mut state = 0x9876_1234_1342_abcd_u64;
+        for b in &mut data {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *b = (state >> 32) as u8;
+        }
+        let mut f = MatchFinder::new(
+            &data,
+            LzOptions {
+                window_size: SOLID_WINDOW,
+                ..LzOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(f.seen.is_some());
+        let mut saved = Vec::new();
+        for pos in (37..data.len() - 67).step_by(97) {
+            f.advance_to(pos).unwrap();
+            saved.push((
+                pos,
+                f.find(pos, 67).unwrap(),
+                f.find_priced(pos, 67).unwrap(),
+            ));
+        }
+        f.advance_to(data.len()).unwrap();
+        let heads = f.heads.clone();
+        let links = f.previous.clone();
+        f.rewind_to(37).unwrap();
+        for (pos, a, b) in saved {
+            f.advance_to(pos).unwrap();
+            assert_eq!(f.find(pos, 67).unwrap(), a);
+            assert_eq!(f.find_priced(pos, 67).unwrap(), b);
+        }
+        f.advance_to(data.len()).unwrap();
+        assert_eq!(f.heads, heads);
+        assert_eq!(f.previous, links);
+        let input = vec![0xff; SOLID_WINDOW];
+        let mut f = MatchFinder::new(
+            &input,
+            LzOptions {
+                hash_bits: 8,
+                chain_depth: 16,
+                window_size: SOLID_WINDOW,
+            },
+        )
+        .unwrap();
+        f.advance_to(input.len()).unwrap();
+        let heads = f.heads.clone();
+        f.rewind_to(input.len() - 4).unwrap();
+        assert_eq!(
+            f.find(input.len() - 4, 4).unwrap()[0],
+            Match {
+                length: 4,
+                distance: 1
+            }
+        );
+        f.insert(input.len() - 4).unwrap();
+        f.advance_to(input.len()).unwrap();
+        assert_eq!(f.heads, heads);
+        f.rewind_to(0).unwrap();
+        f.advance_to(input.len() - 5).unwrap();
+        assert_eq!(
+            f.find(input.len() - 5, 5).unwrap()[0],
+            Match {
+                length: 5,
+                distance: 1
+            }
+        );
+    }
     #[test]
     fn membership_filter_has_no_false_negatives_for_inserted_words() {
         let mut state = 0x9172_41ab_05c3_f099u64;
