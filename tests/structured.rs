@@ -43,9 +43,16 @@ fn structured_frames_roundtrip_and_retain_legacy_candidate() {
                 WexEngine::compress_into(data, level, &mut legacy).unwrap();
             }
             assert!(encoded.len() <= legacy.len());
-            if codec == CodecType::WexStructured {
+            if matches!(codec, CodecType::WexStructured | CodecType::WexContextual) {
                 chose_new = true;
-                assert_eq!(&encoded[..4], b"WXE\x03");
+                assert_eq!(
+                    &encoded[..4],
+                    if codec == CodecType::WexContextual {
+                        b"WXE\x04"
+                    } else {
+                        b"WXE\x03"
+                    }
+                );
                 for at in [0, 4, 6, 8, 16, 20, 24, encoded.len() - 1] {
                     let mut bad = encoded.clone();
                     bad[at] ^= 0x80;
@@ -175,13 +182,10 @@ fn structured_cli_uses_real_new_codec_not_an_empty_archive() {
             .success()
     );
     let mut reader = ArchiveReader::open(&archive, None, ReadLimits::default()).unwrap();
-    assert!(
-        reader
-            .index()
-            .chunk_table
-            .iter()
-            .any(|c| c.header.codec == CodecType::WexStructured)
-    );
+    assert!(reader.index().chunk_table.iter().any(|c| matches!(
+        c.header.codec,
+        CodecType::WexStructured | CodecType::WexContextual
+    )));
     let mut out = Vec::new();
     reader.extract_file("data", &mut out).unwrap();
     assert_eq!(out, fixture());
@@ -212,5 +216,6 @@ fn structured_feature_marker_is_required_in_chunk_index() {
     index.flags.remove(HeaderFlags::STRUCTURED);
     assert!(index.validate().is_err());
     assert_eq!(CodecType::from_u8(4).unwrap(), CodecType::WexStructured);
-    assert!(CodecType::from_u8(5).is_err());
+    assert_eq!(CodecType::from_u8(5).unwrap(), CodecType::WexContextual);
+    assert!(CodecType::from_u8(6).is_err());
 }

@@ -237,6 +237,61 @@ impl<'a> MatchFinder<'a> {
         }
         Ok(best)
     }
+    // Each log-distance slot has a distinct rANS price; retain its longest
+    // match instead of merging those choices into four ULEB128 classes.
+    pub(super) fn find_priced(&self, position: usize, max_length: usize) -> Result<[Match; 25]> {
+        if position != self.cursor || position > self.input.len() {
+            return Err(invalid("nonsequential match lookup"));
+        }
+        let limit = max_length.min(self.input.len() - position);
+        let mut best = [Match::default(); 25];
+        if limit < MIN_MATCH {
+            return Ok(best);
+        }
+        let key = word_key(self.input, position);
+        if self.seen.as_ref().is_some_and(|seen| !seen.contains(key)) {
+            return Ok(best);
+        }
+        let mut candidate = self.heads[(key >> (32 - self.options.hash_bits)) as usize];
+        let mut examined = 0;
+        while candidate != NONE && examined < self.options.chain_depth {
+            let candidate_pos = (candidate & POSITION_MASK) as usize;
+            if candidate_pos >= position {
+                return Err(invalid("nondecreasing match chain"));
+            }
+            let distance = position - candidate_pos;
+            if distance > self.options.window_size {
+                break;
+            }
+            let mut length = 0;
+            if (candidate >> POSITION_BITS) as u8 == self.input[position] {
+                let class = (usize::BITS - 1 - distance.leading_zeros()) as usize;
+                // A differing byte at the current best length cannot improve
+                // this price class. The cached first byte already matched.
+                let known = best[class].length;
+                if known < limit
+                    && (known == 0
+                        || self.input[position + known] == self.input[candidate_pos + known])
+                    && self.input[position..position + MIN_MATCH]
+                        == self.input[candidate_pos..candidate_pos + MIN_MATCH]
+                {
+                    length = common_prefix(
+                        &self.input[position..position + limit],
+                        &self.input[candidate_pos..candidate_pos + limit],
+                    );
+                }
+                if length >= MIN_MATCH && length > best[class].length {
+                    best[class] = Match { length, distance };
+                }
+            }
+            if self.previous.is_empty() {
+                break;
+            }
+            candidate = self.previous[candidate_pos];
+            examined += 1;
+        }
+        Ok(best)
+    }
     pub fn insert(&mut self, position: usize) -> Result<()> {
         if position != self.cursor || position >= self.input.len() {
             return Err(invalid("nonsequential match insertion"));

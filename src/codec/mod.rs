@@ -209,17 +209,27 @@ enum Method {
     Ans = 4,
     Cm = 5,
     Split = 6,
+    Context = 7,
 }
 impl Method {
     fn read(value: u8, codec: CodecType) -> Result<Self> {
         match (value, codec) {
             (0, _) => Ok(Self::Store),
             (1, _) => Ok(Self::Lz),
-            (2, CodecType::WexBalanced | CodecType::WexStructured) => Ok(Self::LzAns),
-            (4, CodecType::WexBalanced | CodecType::WexStructured) => Ok(Self::Ans),
-            (3, CodecType::WexExtreme | CodecType::WexStructured) => Ok(Self::LzCm),
-            (5, CodecType::WexExtreme | CodecType::WexStructured) => Ok(Self::Cm),
-            (6, CodecType::WexStructured) => Ok(Self::Split),
+            (2, CodecType::WexBalanced | CodecType::WexStructured | CodecType::WexContextual) => {
+                Ok(Self::LzAns)
+            }
+            (4, CodecType::WexBalanced | CodecType::WexStructured | CodecType::WexContextual) => {
+                Ok(Self::Ans)
+            }
+            (3, CodecType::WexExtreme | CodecType::WexStructured | CodecType::WexContextual) => {
+                Ok(Self::LzCm)
+            }
+            (5, CodecType::WexExtreme | CodecType::WexStructured | CodecType::WexContextual) => {
+                Ok(Self::Cm)
+            }
+            (6, CodecType::WexStructured | CodecType::WexContextual) => Ok(Self::Split),
+            (7, CodecType::WexContextual) => Ok(Self::Context),
             _ => Err(invalid("unsupported block method for codec")),
         }
     }
@@ -373,6 +383,7 @@ impl WexEngine {
         };
         let structured = use_structured && level.get() >= 4;
         let mut used_structured = false;
+        let mut used_context = false;
         for (n, block) in data.chunks(BLOCK_SIZE).enumerate() {
             let mut local_finder = if structured && !solid {
                 Some(lz::MatchFinder::new(block, options)?)
@@ -433,9 +444,38 @@ impl WexEngine {
                     if encoded.data.len() + MIN_STRUCTURED_SAVING < legacy_limit {
                         best.consider(Method::Split, encoded.tokens, encoded.data);
                     }
+                    let mut context_tokens = seed;
                     if tune {
                         let parsed =
                             structured::parse(finder, range.clone(), &prices, level.get() >= 8)?;
+                        let encoded = structured::encode(source, range.clone(), &parsed)?;
+                        if encoded.data.len() + MIN_STRUCTURED_SAVING < legacy_limit {
+                            best.consider(Method::Split, encoded.tokens, encoded.data);
+                        }
+                        context_tokens = parsed;
+                    }
+                    // Both the old stream and its old parse remain actual candidates.
+                    // Context tables must pay for themselves in the final byte count.
+                    let contextual =
+                        structured::encode_context(source, range.clone(), &context_tokens)?;
+                    let context_prices = contextual.prices.clone();
+                    let tune_context = tune
+                        && contextual.data.len() <= best.payload.len() + best.payload.len() / 4;
+                    if contextual.data.len() + MIN_STRUCTURED_SAVING < legacy_limit {
+                        best.consider(Method::Context, contextual.tokens, contextual.data);
+                    }
+                    if tune_context {
+                        let parsed = structured::parse(
+                            finder,
+                            range.clone(),
+                            &context_prices,
+                            level.get() >= 8,
+                        )?;
+                        let contextual =
+                            structured::encode_context(source, range.clone(), &parsed)?;
+                        if contextual.data.len() + MIN_STRUCTURED_SAVING < legacy_limit {
+                            best.consider(Method::Context, contextual.tokens, contextual.data);
+                        }
                         let encoded = structured::encode(source, range, &parsed)?;
                         if encoded.data.len() + MIN_STRUCTURED_SAVING < legacy_limit {
                             best.consider(Method::Split, encoded.tokens, encoded.data);
@@ -446,6 +486,7 @@ impl WexEngine {
             let lz_size = lz.len();
             best.consider(Method::Lz, lz_size, lz);
             used_structured |= best.method == Method::Split;
+            used_context |= best.method == Method::Context;
             output.extend([best.method as u8, 0, 0, 0]);
             output.extend_from_slice(&(block.len() as u32).to_le_bytes());
             output.extend_from_slice(&(best.intermediate as u32).to_le_bytes());
@@ -456,13 +497,18 @@ impl WexEngine {
                 return Ok(result);
             }
         }
-        if used_structured {
-            output[..4].copy_from_slice(b"WXE\x03");
-            output[4] = CodecType::WexStructured as u8;
+        if used_structured || used_context {
+            let codec = if used_context {
+                CodecType::WexContextual
+            } else {
+                CodecType::WexStructured
+            };
+            output[..4].copy_from_slice(if used_context { b"WXE\x04" } else { b"WXE\x03" });
+            output[4] = codec as u8;
             output[6..8].copy_from_slice(&u16::from(solid).to_le_bytes());
             let checksum = crc32fast::hash(&output[..20]);
             output[20..24].copy_from_slice(&checksum.to_le_bytes());
-            Ok(Some(CodecType::WexStructured))
+            Ok(Some(codec))
         } else {
             Ok(Some(level.codec()))
         }
@@ -496,11 +542,13 @@ impl WexEngine {
         }
         let mut r = Reader::new(data);
         let magic = r.take(4)?;
-        let structured = magic == b"WXE\x03";
+        let contextual = magic == b"WXE\x04";
+        let structured = magic == b"WXE\x03" || contextual;
         let legacy_solid = magic == b"WXE\x02";
         if (magic != b"WXE\x01" && !legacy_solid && !structured)
             || r.u8()? != codec as u8
-            || structured != (codec == CodecType::WexStructured)
+            || structured != matches!(codec, CodecType::WexStructured | CodecType::WexContextual)
+            || contextual != (codec == CodecType::WexContextual)
         {
             return Err(invalid("frame magic or codec"));
         }
@@ -551,7 +599,7 @@ impl WexEngine {
                 {
                     return Err(invalid("LZ intermediate size"));
                 }
-                Method::Split if intermediate == 0 || intermediate > raw_size => {
+                Method::Split | Method::Context if intermediate == 0 || intermediate > raw_size => {
                     return Err(invalid("split intermediate count"));
                 }
                 Method::Ans | Method::Cm if intermediate != raw_size => {
@@ -567,6 +615,9 @@ impl WexEngine {
             let begin = out.len();
             match method {
                 Method::Store => out.extend_from_slice(payload),
+                Method::Context => {
+                    structured::decode_context_append(payload, raw_size, intermediate, solid, out)?
+                }
                 Method::Split => {
                     structured::decode_append(payload, raw_size, intermediate, solid, out)?
                 }

@@ -532,13 +532,23 @@ pub fn pack(
         .map_err(|_| PipelineError::ResourceLimit("chunk count"))?;
     header.footer_offset = file.stream_position()?;
     header.chunk_store_size = header.footer_offset - header.chunk_store_offset;
-    if descriptors
-        .iter()
-        .any(|d| d.header.codec == CodecType::WexStructured)
-    {
+    if descriptors.iter().any(|d| {
+        matches!(
+            d.header.codec,
+            CodecType::WexStructured | CodecType::WexContextual
+        )
+    }) {
         flags.insert(HeaderFlags::STRUCTURED);
         header.flags = flags;
     }
+    if descriptors
+        .iter()
+        .any(|d| d.header.codec == CodecType::WexContextual)
+    {
+        flags.insert(HeaderFlags::LITERAL_CONTEXT);
+        header.flags = flags;
+    }
+
     let footer = IndexFooter::new(flags, descriptors, summary.files)?;
     let index_size = footer.serialized_size()?;
     if index_size > options.limits.decode.max_index_bytes as u64

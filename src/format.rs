@@ -63,6 +63,7 @@ bitflags::bitflags! {
         /// Extended 12-byte file references and independently decoded solid groups.
         const SOLID_GROUPS = 1 << 6;
         const STRUCTURED = 1 << 7;
+        const LITERAL_CONTEXT = 1 << 8;
     }
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     #[repr(transparent)]
@@ -88,6 +89,7 @@ pub enum CodecType {
     WexBalanced = 2,
     WexExtreme = 3,
     WexStructured = 4,
+    WexContextual = 5,
 }
 impl CodecType {
     pub fn from_u8(value: u8) -> Result<Self> {
@@ -97,6 +99,7 @@ impl CodecType {
             2 => Ok(Self::WexBalanced),
             3 => Ok(Self::WexExtreme),
             4 => Ok(Self::WexStructured),
+            5 => Ok(Self::WexContextual),
             n => Err(FormatError::UnknownCodec(n)),
         }
     }
@@ -269,6 +272,11 @@ impl SuperBlock {
             return Err(FormatError::UnsupportedVersion(self.version));
         }
         header_flags(self.flags.bits())?;
+        if self.flags.contains(HeaderFlags::LITERAL_CONTEXT)
+            && !self.flags.contains(HeaderFlags::STRUCTURED)
+        {
+            return Err(invalid("literal context requires structured feature"));
+        }
         if self.flags.contains(HeaderFlags::SOLID_GROUPS)
             && !self.flags.contains(HeaderFlags::SOLID)
         {
@@ -781,6 +789,11 @@ impl IndexFooter {
     }
     pub fn validate(&self) -> Result<()> {
         header_flags(self.flags.bits())?;
+        if self.flags.contains(HeaderFlags::LITERAL_CONTEXT)
+            && !self.flags.contains(HeaderFlags::STRUCTURED)
+        {
+            return Err(invalid("literal context requires structured feature"));
+        }
         if self.flags.contains(HeaderFlags::SOLID_GROUPS)
             && !self.flags.contains(HeaderFlags::SOLID)
         {
@@ -796,10 +809,17 @@ impl IndexFooter {
         let mut previous_end = None;
         for (index, chunk) in self.chunk_table.iter().enumerate() {
             chunk.header.validate()?;
-            if chunk.header.codec == CodecType::WexStructured
-                && !self.flags.contains(HeaderFlags::STRUCTURED)
+            if matches!(
+                chunk.header.codec,
+                CodecType::WexStructured | CodecType::WexContextual
+            ) && !self.flags.contains(HeaderFlags::STRUCTURED)
             {
                 return Err(invalid("structured codec without feature flag"));
+            }
+            if chunk.header.codec == CodecType::WexContextual
+                && !self.flags.contains(HeaderFlags::LITERAL_CONTEXT)
+            {
+                return Err(invalid("context codec without feature flag"));
             }
             if self.flags.contains(HeaderFlags::SOLID_GROUPS)
                 && (chunk.header.uncompressed_size as usize > MAX_SOLID_GROUP_SIZE
@@ -1174,9 +1194,17 @@ impl IndexEnvelope {
     }
     pub fn validate_against(&self, header: &SuperBlock, limits: DecodeLimits) -> Result<()> {
         self.validate(limits)?;
-        if self.codec == CodecType::WexStructured && !header.flags.contains(HeaderFlags::STRUCTURED)
+        if matches!(
+            self.codec,
+            CodecType::WexStructured | CodecType::WexContextual
+        ) && !header.flags.contains(HeaderFlags::STRUCTURED)
         {
             return Err(invalid("structured index without feature flag"));
+        }
+        if self.codec == CodecType::WexContextual
+            && !header.flags.contains(HeaderFlags::LITERAL_CONTEXT)
+        {
+            return Err(invalid("context index without feature flag"));
         }
         header.validate()?;
         if !header.verify_checksum() {
