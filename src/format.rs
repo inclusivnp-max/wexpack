@@ -62,6 +62,7 @@ bitflags::bitflags! {
         const ENCRYPTED_DATA = 1 << 5;
         /// Extended 12-byte file references and independently decoded solid groups.
         const SOLID_GROUPS = 1 << 6;
+        const STRUCTURED = 1 << 7;
     }
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     #[repr(transparent)]
@@ -86,6 +87,7 @@ pub enum CodecType {
     WexTurbo = 1,
     WexBalanced = 2,
     WexExtreme = 3,
+    WexStructured = 4,
 }
 impl CodecType {
     pub fn from_u8(value: u8) -> Result<Self> {
@@ -94,6 +96,7 @@ impl CodecType {
             1 => Ok(Self::WexTurbo),
             2 => Ok(Self::WexBalanced),
             3 => Ok(Self::WexExtreme),
+            4 => Ok(Self::WexStructured),
             n => Err(FormatError::UnknownCodec(n)),
         }
     }
@@ -793,6 +796,11 @@ impl IndexFooter {
         let mut previous_end = None;
         for (index, chunk) in self.chunk_table.iter().enumerate() {
             chunk.header.validate()?;
+            if chunk.header.codec == CodecType::WexStructured
+                && !self.flags.contains(HeaderFlags::STRUCTURED)
+            {
+                return Err(invalid("structured codec without feature flag"));
+            }
             if self.flags.contains(HeaderFlags::SOLID_GROUPS)
                 && (chunk.header.uncompressed_size as usize > MAX_SOLID_GROUP_SIZE
                     || chunk.header.transformed_size as usize > MAX_SOLID_GROUP_SIZE
@@ -1166,6 +1174,10 @@ impl IndexEnvelope {
     }
     pub fn validate_against(&self, header: &SuperBlock, limits: DecodeLimits) -> Result<()> {
         self.validate(limits)?;
+        if self.codec == CodecType::WexStructured && !header.flags.contains(HeaderFlags::STRUCTURED)
+        {
+            return Err(invalid("structured index without feature flag"));
+        }
         header.validate()?;
         if !header.verify_checksum() {
             return Err(FormatError::ChecksumMismatch);

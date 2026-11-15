@@ -224,11 +224,13 @@ fn compress(mut job: Job, level: u8, solid: bool) -> Result<Finished> {
         if prepared.transform == TransformType::DictWord
             && prepared.data.len() <= MAX_SOLID_GROUP_SIZE
         {
-            let identity_codec = WexEngine::compress_solid_into(raw, level, &mut buffers.output)?;
+            let identity_codec =
+                WexEngine::compress_structured_into(raw, level, true, &mut buffers.output)?;
             let mut filtered = Vec::new();
-            if let Some(filtered_codec) = WexEngine::compress_solid_bounded_into(
+            if let Some(filtered_codec) = WexEngine::compress_structured_bounded_into(
                 &prepared.data,
                 level,
+                true,
                 &mut filtered,
                 buffers.output.len().saturating_sub(1),
             )? {
@@ -242,12 +244,17 @@ fn compress(mut job: Job, level: u8, solid: bool) -> Result<Finished> {
         } else if prepared.transform != TransformType::None
             && prepared.data.len() <= MAX_SOLID_GROUP_SIZE
         {
-            let filtered_codec =
-                WexEngine::compress_solid_into(&prepared.data, level, &mut buffers.output)?;
+            let filtered_codec = WexEngine::compress_structured_into(
+                &prepared.data,
+                level,
+                true,
+                &mut buffers.output,
+            )?;
             let mut identity = Vec::new();
-            if let Some(identity_codec) = WexEngine::compress_solid_bounded_into(
+            if let Some(identity_codec) = WexEngine::compress_structured_bounded_into(
                 raw,
                 level,
+                true,
                 &mut identity,
                 buffers.output.len(),
             )? {
@@ -261,14 +268,14 @@ fn compress(mut job: Job, level: u8, solid: bool) -> Result<Finished> {
         } else {
             transform = TransformType::None;
             transformed_size = raw.len();
-            WexEngine::compress_solid_into(raw, level, &mut buffers.output)?
+            WexEngine::compress_structured_into(raw, level, true, &mut buffers.output)?
         }
     } else if prepared.bypass_compression {
         buffers.output.clear();
         buffers.output.extend_from_slice(&prepared.data);
         CodecType::Store
     } else {
-        WexEngine::compress_into(&prepared.data, level, &mut buffers.output)?
+        WexEngine::compress_structured_into(&prepared.data, level, false, &mut buffers.output)?
     };
     let header = ChunkHeader {
         chunk_id: job.id,
@@ -425,7 +432,7 @@ pub fn pack(
     if declared > options.limits.max_total_output_bytes {
         return Err(PipelineError::ResourceLimit("declared input bytes"));
     }
-    let flags = HeaderFlags::PRECOMP
+    let mut flags = HeaderFlags::PRECOMP
         | if options.dedup {
             HeaderFlags::DEDUP
         } else {
@@ -525,6 +532,13 @@ pub fn pack(
         .map_err(|_| PipelineError::ResourceLimit("chunk count"))?;
     header.footer_offset = file.stream_position()?;
     header.chunk_store_size = header.footer_offset - header.chunk_store_offset;
+    if descriptors
+        .iter()
+        .any(|d| d.header.codec == CodecType::WexStructured)
+    {
+        flags.insert(HeaderFlags::STRUCTURED);
+        header.flags = flags;
+    }
     let footer = IndexFooter::new(flags, descriptors, summary.files)?;
     let index_size = footer.serialized_size()?;
     if index_size > options.limits.decode.max_index_bytes as u64

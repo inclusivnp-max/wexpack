@@ -137,6 +137,51 @@ impl<'a> MatchFinder<'a> {
             },
         })
     }
+    pub(super) fn source(&self) -> &'a [u8] {
+        self.input
+    }
+    /// Undo a block in reverse insertion order. Old membership bits may remain:
+    /// they only cause false positives, never future dictionary references.
+    pub(super) fn rewind_to(&mut self, start: usize) -> Result<()> {
+        if start > self.cursor || self.previous.is_empty() {
+            return Err(invalid("LZ rewind range"));
+        }
+        while self.cursor > start {
+            self.cursor -= 1;
+            let pos = self.cursor;
+            if self.input.len() - pos >= MIN_MATCH {
+                let hash = (word_key(self.input, pos) >> (32 - self.options.hash_bits)) as usize;
+                if (self.heads[hash] & POSITION_MASK) as usize != pos {
+                    return Err(invalid("LZ rewind chain"));
+                }
+                self.heads[hash] = self.previous[pos];
+            }
+        }
+        Ok(())
+    }
+    pub(super) fn at_distance(
+        &self,
+        pos: usize,
+        max_length: usize,
+        distance: usize,
+    ) -> Result<Match> {
+        if pos != self.cursor || pos > self.input.len() {
+            return Err(invalid("repeat lookup position"));
+        }
+        if distance == 0 || distance > pos || distance > self.options.window_size {
+            return Ok(Match::default());
+        }
+        let limit = max_length.min(self.input.len() - pos);
+        let length = common_prefix(
+            &self.input[pos..pos + limit],
+            &self.input[pos - distance..pos - distance + limit],
+        );
+        Ok(if length >= MIN_MATCH {
+            Match { length, distance }
+        } else {
+            Match::default()
+        })
+    }
     /// Best length for each ULEB128 distance-price class. All positions before
     /// `position` must have been inserted; future bytes are never dictionary entries.
     pub fn find(&self, position: usize, max_length: usize) -> Result<[Match; 4]> {
@@ -210,7 +255,7 @@ impl<'a> MatchFinder<'a> {
         self.cursor += 1;
         Ok(())
     }
-    fn advance_to(&mut self, end: usize) -> Result<()> {
+    pub(super) fn advance_to(&mut self, end: usize) -> Result<()> {
         if end > self.input.len() || end < self.cursor {
             return Err(invalid("match insertion range"));
         }
@@ -492,7 +537,7 @@ fn write_varint(mut value: u32, out: &mut Vec<u8>) {
     }
     out.push(value as u8);
 }
-fn read_varint(reader: &mut Reader<'_>) -> Result<u32> {
+pub(super) fn read_varint(reader: &mut Reader<'_>) -> Result<u32> {
     let mut value = 0;
     for i in 0..5 {
         let byte = reader.u8()?;

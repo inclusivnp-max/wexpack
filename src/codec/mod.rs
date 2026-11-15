@@ -11,6 +11,7 @@
 pub mod ans;
 pub mod cm;
 pub mod lz;
+mod structured;
 
 use crate::format::{CodecType, MAX_STORED_CHUNK_SIZE};
 use std::borrow::Cow;
@@ -20,6 +21,9 @@ pub const BLOCK_SIZE: usize = 256 << 10;
 pub const MAX_LZ_SIZE: usize = BLOCK_SIZE + BLOCK_SIZE.div_ceil(8);
 const FRAME_HEADER: usize = 24;
 const BLOCK_HEADER: usize = 20;
+const MIN_STRUCTURED_SAVING: usize = 16;
+const MIN_MATCH_COVERAGE_DENOMINATOR: usize = 16;
+const PRICE_TRIAL_SLACK_DENOMINATOR: usize = 4;
 pub type Result<T> = std::result::Result<T, CodecError>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,16 +208,18 @@ enum Method {
     LzCm = 3,
     Ans = 4,
     Cm = 5,
+    Split = 6,
 }
 impl Method {
     fn read(value: u8, codec: CodecType) -> Result<Self> {
         match (value, codec) {
             (0, _) => Ok(Self::Store),
             (1, _) => Ok(Self::Lz),
-            (2, CodecType::WexBalanced) => Ok(Self::LzAns),
-            (4, CodecType::WexBalanced) => Ok(Self::Ans),
-            (3, CodecType::WexExtreme) => Ok(Self::LzCm),
-            (5, CodecType::WexExtreme) => Ok(Self::Cm),
+            (2, CodecType::WexBalanced | CodecType::WexStructured) => Ok(Self::LzAns),
+            (4, CodecType::WexBalanced | CodecType::WexStructured) => Ok(Self::Ans),
+            (3, CodecType::WexExtreme | CodecType::WexStructured) => Ok(Self::LzCm),
+            (5, CodecType::WexExtreme | CodecType::WexStructured) => Ok(Self::Cm),
+            (6, CodecType::WexStructured) => Ok(Self::Split),
             _ => Err(invalid("unsupported block method for codec")),
         }
     }
@@ -269,7 +275,7 @@ impl WexEngine {
     }
     /// The output buffer can be retained by a worker between chunks.
     pub fn compress_into(data: &[u8], level: u8, output: &mut Vec<u8>) -> Result<CodecType> {
-        Self::compress_frame(data, level, output, false, None)?
+        Self::compress_frame(data, level, output, false, None, false)?
             .ok_or_else(|| invalid("unbounded frame aborted"))
     }
     /// WXE revision 2 keeps LZ history across blocks inside a bounded solid frame.
@@ -277,7 +283,7 @@ impl WexEngine {
         if data.len() > lz::SOLID_WINDOW {
             return Err(CodecError::InputLimit);
         }
-        Self::compress_frame(data, level, output, true, None)?
+        Self::compress_frame(data, level, output, true, None, false)?
             .ok_or_else(|| invalid("unbounded frame aborted"))
     }
     /// Returns None only when neither the partial frame nor STORE can fit the
@@ -291,7 +297,27 @@ impl WexEngine {
         if data.len() > lz::SOLID_WINDOW {
             return Err(CodecError::InputLimit);
         }
-        Self::compress_frame(data, level, output, true, Some(max_size))
+        Self::compress_frame(data, level, output, true, Some(max_size), false)
+    }
+    /// Structured streams retain the legacy block candidate and write codec 4
+    /// only if a split-stream block wins by at least sixteen bytes.
+    pub fn compress_structured_into(
+        data: &[u8],
+        level: u8,
+        solid: bool,
+        output: &mut Vec<u8>,
+    ) -> Result<CodecType> {
+        Self::compress_frame(data, level, output, solid, None, true)?
+            .ok_or_else(|| invalid("unbounded structured frame aborted"))
+    }
+    pub fn compress_structured_bounded_into(
+        data: &[u8],
+        level: u8,
+        solid: bool,
+        output: &mut Vec<u8>,
+        max_size: usize,
+    ) -> Result<Option<CodecType>> {
+        Self::compress_frame(data, level, output, solid, Some(max_size), true)
     }
     fn compress_frame(
         data: &[u8],
@@ -299,8 +325,12 @@ impl WexEngine {
         output: &mut Vec<u8>,
         solid: bool,
         budget: Option<usize>,
+        use_structured: bool,
     ) -> Result<Option<CodecType>> {
         let level = CompressionLevel::new(level)?;
+        if solid && data.len() > lz::SOLID_WINDOW {
+            return Err(CodecError::InputLimit);
+        }
         if data.len() > MAX_STORED_CHUNK_SIZE as usize {
             return Err(CodecError::InputLimit);
         }
@@ -341,7 +371,14 @@ impl WexEngine {
         } else {
             None
         };
+        let structured = use_structured && level.get() >= 4;
+        let mut used_structured = false;
         for (n, block) in data.chunks(BLOCK_SIZE).enumerate() {
+            let mut local_finder = if structured && !solid {
+                Some(lz::MatchFinder::new(block, options)?)
+            } else {
+                None
+            };
             let mut best = Candidate {
                 method: Method::Store,
                 intermediate: 0,
@@ -350,6 +387,8 @@ impl WexEngine {
             let lz = if let Some(finder) = &mut solid_finder {
                 let start = n * BLOCK_SIZE;
                 lz::encode_solid_block(finder, start..start + block.len(), mode)?
+            } else if let Some(finder) = &mut local_finder {
+                lz::encode_solid_block(finder, 0..block.len(), mode)?
             } else {
                 lz::encode(block, mode, options)?
             };
@@ -364,8 +403,49 @@ impl WexEngine {
                 }
                 _ => {}
             }
+            if structured {
+                let legacy_limit = best.payload.len().min(lz.len());
+                let range = if solid {
+                    n * BLOCK_SIZE..n * BLOCK_SIZE + block.len()
+                } else {
+                    0..block.len()
+                };
+                let finder = if solid {
+                    solid_finder.as_mut()
+                } else {
+                    local_finder.as_mut()
+                }
+                .ok_or_else(|| invalid("structured finder"))?;
+                let source = finder.source();
+                let seed = structured::seed(&lz, block.len())?;
+                let matched_bytes = block.len() - seed.iter().filter(|t| t.distance == 0).count();
+                // Sparse random-data matches do not justify a second model at
+                // balanced levels. The legacy candidate always remains available.
+                if level.get() >= 8 || matched_bytes * MIN_MATCH_COVERAGE_DENOMINATOR >= block.len()
+                {
+                    let encoded = structured::encode(source, range.clone(), &seed)?;
+                    let prices = encoded.prices.clone();
+                    let tune = encoded.matches >= 4
+                        && encoded.tokens >= 32
+                        && (level.get() >= 8
+                            || encoded.data.len()
+                                <= legacy_limit + legacy_limit / PRICE_TRIAL_SLACK_DENOMINATOR);
+                    if encoded.data.len() + MIN_STRUCTURED_SAVING < legacy_limit {
+                        best.consider(Method::Split, encoded.tokens, encoded.data);
+                    }
+                    if tune {
+                        let parsed =
+                            structured::parse(finder, range.clone(), &prices, level.get() >= 8)?;
+                        let encoded = structured::encode(source, range, &parsed)?;
+                        if encoded.data.len() + MIN_STRUCTURED_SAVING < legacy_limit {
+                            best.consider(Method::Split, encoded.tokens, encoded.data);
+                        }
+                    }
+                }
+            }
             let lz_size = lz.len();
             best.consider(Method::Lz, lz_size, lz);
+            used_structured |= best.method == Method::Split;
             output.extend([best.method as u8, 0, 0, 0]);
             output.extend_from_slice(&(block.len() as u32).to_le_bytes());
             output.extend_from_slice(&(best.intermediate as u32).to_le_bytes());
@@ -376,7 +456,16 @@ impl WexEngine {
                 return Ok(result);
             }
         }
-        Ok(Some(level.codec()))
+        if used_structured {
+            output[..4].copy_from_slice(b"WXE\x03");
+            output[4] = CodecType::WexStructured as u8;
+            output[6..8].copy_from_slice(&u16::from(solid).to_le_bytes());
+            let checksum = crc32fast::hash(&output[..20]);
+            output[20..24].copy_from_slice(&checksum.to_le_bytes());
+            Ok(Some(CodecType::WexStructured))
+        } else {
+            Ok(Some(level.codec()))
+        }
     }
     pub fn decompress(data: &[u8], codec: CodecType, expected_size: usize) -> Result<Vec<u8>> {
         let mut out = Vec::new();
@@ -407,16 +496,24 @@ impl WexEngine {
         }
         let mut r = Reader::new(data);
         let magic = r.take(4)?;
-        let solid = magic == b"WXE\x02";
-        if (magic != b"WXE\x01" && !solid) || r.u8()? != codec as u8 {
+        let structured = magic == b"WXE\x03";
+        let legacy_solid = magic == b"WXE\x02";
+        if (magic != b"WXE\x01" && !legacy_solid && !structured)
+            || r.u8()? != codec as u8
+            || structured != (codec == CodecType::WexStructured)
+        {
             return Err(invalid("frame magic or codec"));
         }
+        let level = CompressionLevel::new(r.u8()?)?;
+        let flags = r.u16()?;
+        if (structured && (level.get() < 4 || flags & !1 != 0))
+            || (!structured && (level.codec() != codec || flags != 0))
+        {
+            return Err(invalid("frame level or flags"));
+        }
+        let solid = legacy_solid || (structured && flags & 1 != 0);
         if solid && expected_size > lz::SOLID_WINDOW {
             return Err(CodecError::OutputLimit);
-        }
-        let level = CompressionLevel::new(r.u8()?)?;
-        if level.codec() != codec || r.u16()? != 0 {
-            return Err(invalid("frame level or flags"));
         }
         exact(r.u32()? as usize, expected_size)?;
         let blocks = r.u32()? as usize;
@@ -454,6 +551,9 @@ impl WexEngine {
                 {
                     return Err(invalid("LZ intermediate size"));
                 }
+                Method::Split if intermediate == 0 || intermediate > raw_size => {
+                    return Err(invalid("split intermediate count"));
+                }
                 Method::Ans | Method::Cm if intermediate != raw_size => {
                     return Err(invalid("direct entropy size"));
                 }
@@ -467,6 +567,9 @@ impl WexEngine {
             let begin = out.len();
             match method {
                 Method::Store => out.extend_from_slice(payload),
+                Method::Split => {
+                    structured::decode_append(payload, raw_size, intermediate, solid, out)?
+                }
                 Method::Lz | Method::LzAns | Method::LzCm => {
                     let decoded;
                     let lz_payload = match method {
